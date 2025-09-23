@@ -272,8 +272,8 @@ def train_initial_model(preferred_model='Random Forest'):
 def main():
     st.set_page_config(page_title="Water Hardness Predictor", page_icon="💧", layout="wide")
     
-    st.title("💧 Water Hardness Prediction System")
-    st.markdown("**Predict Total Hardness from Conductivity and pH with Continuous Learning**")
+    st.title("💧WHPS")
+    st.markdown("**Predict TH from EC and pH with Continuous Learning**")
     
     # Load model and data
     load_model_and_data()
