@@ -1,105 +1,164 @@
+
 import streamlit as st
-import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
 import numpy as np
+import pandas as pd
+import joblib
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+import math
+import io
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Water Hardness Predictor",
-    page_icon="💧",
-    layout="centered"
-)
+st.set_page_config(page_title="Total Hardness Predictor", page_icon="💧", layout="centered")
 
-# --- Model Training ---
-# This section prepares the model. It's best to have it at the top.
+st.title("💧 Total Hardness Predictor")
+st.write("Predict **Total Hardness (ppm as CaCO₃)** from **Conductivity (µS/cm)** and **pH**.")
 
-# 1. The original dataset provided by the user.
-# In a real-world app, this might be loaded from a file or database.
-data = {
-    'Total Hardness (ppm)': [1590, 1390, 1460, 1430, 1430, 1400, 1500, 1510, 1430, 1480, 1270, 1190, 1390, 1390],
-    'Conductivity (µS/cm)': [4520, 4230, 4311, 4320, 4400, 4340, 4348, 4800, 4360, 5490, 4240, 4250, 4840, 4820],
-    'pH': [7.74, 8.14, 7.95, 8.16, 8.24, 8.76, 7.79, 8.00, 8.00, 8.00, 7.68, 8.12, 8.22, 7.97]
-}
-df = pd.DataFrame(data)
-
-# 2. Define features (X) and target (y).
-features = ['Conductivity (µS/cm)', 'pH']
-target = 'Total Hardness (ppm)'
-
-X = df[features]
-y = df[target]
-
-# 3. Initialize and train the Random Forest model.
-# We use the entire dataset for training to make the best possible
-# predictor based on the limited data available.
-# random_state ensures the model is consistent every time it runs.
-rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
-rf_model.fit(X, y)
-
-
-# --- Streamlit User Interface ---
-
-# Header
-st.title("💧 Water Total Hardness Predictor")
-st.markdown("""
-This application predicts the **Total Hardness (ppm)** of a water sample based on its **Conductivity** and **pH**. 
-The prediction is made using a Random Forest Regressor model.
-""")
-
-# --- User Input Section ---
-st.sidebar.header("Input Water Parameters")
-st.sidebar.markdown("Use the sliders to input the values from your water test.")
-
-# Create sliders for user input in the sidebar.
-conductivity_input = st.sidebar.slider(
-    'Conductivity (µS/cm)',
-    min_value=float(X['Conductivity (µS/cm)'].min()),
-    max_value=float(X['Conductivity (µS/cm)'].max()),
-    value=float(X['Conductivity (µS/cm)'].mean()),
-    step=1.0
-)
-
-ph_input = st.sidebar.slider(
-    'pH',
-    min_value=float(X['pH'].min()),
-    max_value=float(X['pH'].max()),
-    value=float(X['pH'].mean()),
-    step=0.01
-)
-
-# --- Prediction and Display ---
-
-# Create a DataFrame from the user's input
-user_input_df = pd.DataFrame({
-    'Conductivity (µS/cm)': [conductivity_input],
-    'pH': [ph_input]
-})
-
-# Make the prediction
-prediction = rf_model.predict(user_input_df)
-
-# Display the result
-st.header("Prediction Result")
-st.metric(
-    label="Predicted Total Hardness",
-    value=f"{prediction[0]:.2f} ppm"
-)
-
-# --- Important Disclaimer ---
-st.warning("""
-**Disclaimer:** This model is trained on a very small dataset (14 samples). 
-While it may provide a reasonable estimate, its predictions should be considered a guideline and not a substitute for precise laboratory analysis. The accuracy will improve significantly with more data.
-""")
-
-
-# --- Expander for more info ---
-with st.expander("About the Model"):
+with st.expander("ℹ️ How it works / Notes"):
     st.markdown("""
-    - **Model Used:** `Random Forest Regressor`. This is a powerful machine learning model that works by building a multitude of decision trees and averaging their outputs. This "wisdom of the crowd" approach generally leads to more accurate and stable predictions compared to a single decision tree.
-    - **Training Data:** The model was trained on the 14 data points you provided.
-    - **Features:** The model uses two features for its prediction: `Conductivity (µS/cm)` and `pH`.
+    - The default model is a **Random Forest** trained on your dataset (conductivity-only performed best in the sample).
+    - You can **upload a CSV** with columns like: `Total Hardness (ppm)`, `Conductivity (µS/cm)`, `pH` to train a new model inside the app.
+    - pH typically adds little signal unless data spans a wide range; **conductivity** tends to be the dominant predictor.
+    - This is an empirical model. For production/QA decisions, validate with your own data (e.g., time-based splits).
     """)
 
-# Display the training data for reference
-st.subheader("Training Data Used")
-st.dataframe(df, use_container_width=True)
+def rmse(y_true, y_pred):
+    from sklearn.metrics import mean_squared_error
+    return math.sqrt(mean_squared_error(y_true, y_pred))
+
+@st.cache_resource
+def load_default_model():
+    try:
+        blob = open("hardness_model.pkl", "rb").read()
+        obj = joblib.load(io.BytesIO(blob))
+        return obj
+    except Exception as e:
+        return None
+
+def train_from_csv(df, use_ph: bool):
+    # Cast/clean
+    cols = ['Total Hardness (ppm)', 'Conductivity (µS/cm)']
+    if use_ph:
+        cols.append('pH')
+    for c in cols:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column: {c}")
+    d = df.copy()
+    for c in cols:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=cols).copy()
+    d = d[(d['Total Hardness (ppm)'] > 0) & (d['Conductivity (µS/cm)'] > 0)]
+    d = d[(~d['pH'].isna())] if use_ph else d
+    d = d[(d['pH'] >= 0) & (d['pH'] <= 14)] if use_ph else d
+    if len(d) < 10:
+        raise ValueError("Not enough rows after cleaning (need at least 10).")
+
+    X_cols = ['Conductivity (µS/cm)'] + (['pH'] if use_ph else [])
+    X = d[X_cols].values
+    y = d['Total Hardness (ppm)'].values
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=max(3, int(0.2*len(y))), random_state=42
+    )
+    model = RandomForestRegressor(n_estimators=400, random_state=42)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    metrics = {
+        "Test_R2": float(r2_score(y_test, y_pred)),
+        "Test_MAE": float(mean_absolute_error(y_test, y_pred)),
+        "Test_RMSE": float(rmse(y_test, y_pred)),
+        "n": int(len(d)),
+        "features": X_cols
+    }
+    return model, metrics
+
+def rf_std_prediction(model: RandomForestRegressor, X: np.ndarray):
+    # Approximate uncertainty: std across trees
+    try:
+        preds = np.stack([t.predict(X) for t in model.estimators_], axis=0)  # [n_trees, n_samples]
+        mean = preds.mean(axis=0)
+        std = preds.std(axis=0, ddof=1)
+        return mean, std
+    except Exception:
+        return model.predict(X), np.full((X.shape[0],), np.nan)
+
+st.sidebar.header("Model Source")
+mode = st.sidebar.radio(
+    "Choose how to get a model:",
+    ["Use packaged model", "Upload CSV and train here"]
+)
+
+use_ph_flag = st.sidebar.checkbox("Include pH in training (when uploading CSV)", value=False)
+
+model_obj = None
+feature_cols = None
+metrics_info = None
+
+if mode == "Use packaged model":
+    model_obj = load_default_model()
+    if model_obj is None:
+        st.error("Packaged model not found. Please switch to 'Upload CSV and train here'.")
+    else:
+        model = model_obj['model']
+        feature_cols = model_obj['feature_columns']
+        metrics_info = model_obj.get('metrics', {})
+        st.sidebar.success("Loaded packaged model.")
+        st.sidebar.write("Features:", ", ".join(feature_cols))
+else:
+    st.sidebar.info("Upload a CSV with columns including 'Total Hardness (ppm)', 'Conductivity (µS/cm)' and optionally 'pH'.")
+    uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+    if uploaded:
+        try:
+            df = pd.read_csv(uploaded)
+            model, metrics_info = train_from_csv(df, use_ph=use_ph_flag)
+            model_obj = {"model": model, "feature_columns": (['Conductivity (µS/cm)'] + (['pH'] if use_ph_flag else []))}
+            feature_cols = model_obj['feature_columns']
+            st.sidebar.success("Model trained from your CSV.")
+            st.sidebar.write("Features:", ", ".join(feature_cols))
+            st.sidebar.write("Metrics:", metrics_info)
+        except Exception as e:
+            st.sidebar.error(f"Training failed: {e}")
+
+st.markdown("---")
+st.subheader("🔢 Make a prediction")
+
+c = st.number_input("Conductivity (µS/cm)", min_value=0.0, value=4500.0, step=10.0, help="Unit: microsiemens per centimeter")
+ph = st.number_input("pH (0–14)", min_value=0.0, max_value=14.0, value=8.0, step=0.01)
+
+predict_btn = st.button("Predict Total Hardness")
+
+if predict_btn:
+    if model_obj is None:
+        st.error("No model is loaded. Load packaged model or train from CSV first.")
+    else:
+        # Align feature vector
+        X_list = []
+        for f in feature_cols:
+            if f.lower().startswith("conductivity"):
+                X_list.append([c])
+            elif f.lower() == "pH".lower():
+                X_list.append([ph])
+        X_vec = np.array([v[0] for v in X_list], dtype=float).reshape(1, -1)
+
+        model = model_obj['model']
+        y_mean, y_std = rf_std_prediction(model, X_vec)
+        y_pred = float(y_mean[0])
+        st.success(f"Predicted Total Hardness: **{y_pred:,.0f} ppm as CaCO₃**")
+        if not np.isnan(y_std[0]):
+            lo = y_pred - 1.96 * float(y_std[0])
+            hi = y_pred + 1.96 * float(y_std[0])
+            st.caption(f"Approx. uncertainty band (not a formal CI): {lo:,.0f} – {hi:,.0f} ppm")
+
+        if metrics_info:
+            with st.expander("Model metrics"):
+                st.json(metrics_info)
+
+st.markdown("---")
+st.subheader("📄 Data dictionary")
+st.markdown("""
+- **Total Hardness (ppm as CaCO₃)**: Target variable.
+- **Conductivity (µS/cm)**: Primary predictor; higher conductivity often correlates with higher hardness depending on ions present.
+- **pH (0–14)**: Optional predictor; limited direct correlation in many datasets.
+""")
+
+st.caption("Tip: For reliable results, periodically retrain with updated lab data and validate with a time-based split.")
