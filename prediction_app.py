@@ -1,233 +1,526 @@
-
 import streamlit as st
-import numpy as np
 import pandas as pd
-import joblib
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-import os, io, math, datetime, json
+import numpy as np
+import pickle
+import os
+from datetime import datetime
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.pipeline import Pipeline
+import warnings
+warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="Total Hardness Predictor (v3)", page_icon="💧", layout="wide")
-st.title("💧 Total Hardness Predictor — v3 (Persistent, Import, Column Mapper)")
+# Configuration
+MODEL_FILE = 'hardness_model.pkl'
+SCALER_FILE = 'scaler.pkl'
+DATA_FILE = 'training_data.csv'
+POLY_FILE = 'poly_features.pkl'
 
-DATA_PATH = "data/hardness_data.csv"
-MODEL_PATH = "hardness_model.pkl"
-FEATURES_SIDE_CAR = "feature_columns.json"
-os.makedirs("data", exist_ok=True)
+class WaterHardnessPredictor:
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.poly_features = PolynomialFeatures(degree=2, include_bias=False)
+        self.feature_names = ['Conductivity', 'pH']
+        
+    def create_features(self, conductivity, ph):
+        """Create engineered features from conductivity and pH"""
+        # Basic features
+        features = np.array([[conductivity, ph]])
+        
+        # Polynomial features
+        poly_features = self.poly_features.fit_transform(features)
+        
+        # Additional engineered features
+        conductivity_ph_ratio = conductivity / ph if ph != 0 else 0
+        log_conductivity = np.log(conductivity) if conductivity > 0 else 0
+        ph_squared = ph ** 2
+        
+        # Combine all features
+        engineered = np.array([[
+            conductivity, ph, 
+            conductivity_ph_ratio, 
+            log_conductivity, 
+            ph_squared,
+            conductivity * ph,  # interaction term
+        ]])
+        
+        return engineered
+    
+    def train_model(self, X, y):
+        """Train the model with cross-validation to select best algorithm"""
+        
+        # Scale features
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Test multiple algorithms
+        models = {
+            'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42),
+            'Gradient Boosting': GradientBoostingRegressor(random_state=42),
+            'Ridge Regression': Ridge(alpha=1.0),
+            'Linear Regression': LinearRegression()
+        }
+        
+        best_score = -np.inf
+        best_model = None
+        best_name = None
+        
+        for name, model in models.items():
+            try:
+                # Cross-validation score
+                scores = cross_val_score(model, X_scaled, y, cv=min(5, len(X)), 
+                                       scoring='r2', n_jobs=-1)
+                avg_score = np.mean(scores)
+                
+                if avg_score > best_score:
+                    best_score = avg_score
+                    best_model = model
+                    best_name = name
+            except:
+                continue
+        
+        # Train the best model
+        if best_model is not None:
+            self.model = best_model
+            self.model.fit(X_scaled, y)
+            return best_name, best_score
+        
+        # Fallback to Ridge Regression
+        self.model = Ridge(alpha=1.0)
+        self.model.fit(X_scaled, y)
+        return "Ridge Regression (Fallback)", 0.0
+    
+    def predict(self, conductivity, ph):
+        """Make a prediction"""
+        if self.model is None:
+            return None
+        
+        features = self.create_features(conductivity, ph)
+        features_scaled = self.scaler.transform(features)
+        prediction = self.model.predict(features_scaled)
+        return prediction[0]
+    
+    def retrain_with_new_data(self, new_data):
+        """Retrain the model with new data points"""
+        if len(new_data) == 0:
+            return
+        
+        # Prepare features
+        X = []
+        y = []
+        
+        for _, row in new_data.iterrows():
+            features = self.create_features(row['Conductivity'], row['pH'])
+            X.append(features[0])
+            y.append(row['Total_Hardness'])
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        # Retrain
+        self.train_model(X, y)
 
-def rmse(y_true, y_pred):
-    from sklearn.metrics import mean_squared_error
-    return math.sqrt(mean_squared_error(y_true, y_pred))
+# Initialize session state
+if 'predictor' not in st.session_state:
+    st.session_state.predictor = WaterHardnessPredictor()
+    st.session_state.training_data = pd.DataFrame()
+    st.session_state.predictions_made = []
 
-def now_iso():
-    import datetime
-    return datetime.datetime.utcnow().isoformat()
-
-def load_data() -> pd.DataFrame:
-    if os.path.exists(DATA_PATH):
-        try:
-            return pd.read_csv(DATA_PATH)
-        except Exception:
-            pass
-    cols = ["timestamp", "Conductivity (µS/cm)", "pH", "Total Hardness (ppm)", "source"]
-    df = pd.DataFrame(columns=cols)
-    df.to_csv(DATA_PATH, index=False)
-    return df
-
-def save_data(df: pd.DataFrame):
-    df.to_csv(DATA_PATH, index=False)
-
-def clean_training_dataframe(df: pd.DataFrame, use_ph: bool) -> pd.DataFrame:
-    d = df.copy()
-    for c in ["Conductivity (µS/cm)", "pH", "Total Hardness (ppm)"]:
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")
-    req = ["Total Hardness (ppm)", "Conductivity (µS/cm)"]
-    if use_ph:
-        req.append("pH")
-    d = d.dropna(subset=req)
-    d = d[(d["Total Hardness (ppm)"] > 0) & (d["Conductivity (µS/cm)"] > 0)]
-    if use_ph:
-        d = d[(d["pH"] >= 0) & (d["pH"] <= 14)]
-    return d
-
-def package_model(model, feature_columns, metrics: dict):
-    return {"model": model, "feature_columns": feature_columns, "metrics": metrics}
-
-def _read_sidecar_features():
-    if os.path.exists(FEATURES_SIDE_CAR):
-        try:
-            with open(FEATURES_SIDE_CAR, "r") as f:
-                obj = json.load(f)
-            if isinstance(obj, dict) and "feature_columns" in obj:
-                return obj["feature_columns"]
-        except Exception:
-            pass
-    return None
-
-def load_model():
-    if not os.path.exists(MODEL_PATH):
-        return None
-    try:
-        obj = joblib.load(MODEL_PATH)
-    except Exception:
-        return None
-    if isinstance(obj, dict) and "model" in obj:
-        return obj
-    feat = _read_sidecar_features() or ["Conductivity (µS/cm)"]
-    return {"model": obj, "feature_columns": feat, "metrics": {}}
-
-def save_model(bundle):
-    with open(MODEL_PATH, "wb") as f:
-        joblib.dump(bundle, f)
-    try:
-        with open(FEATURES_SIDE_CAR, "w") as f:
-            json.dump({"feature_columns": bundle.get("feature_columns", [])}, f)
-    except Exception:
-        pass
-
-def train_model(df_all: pd.DataFrame, use_ph: bool):
-    from sklearn.ensemble import RandomForestRegressor
-    d = clean_training_dataframe(df_all, use_ph=use_ph)
-    if len(d) < 10:
-        raise ValueError("Not enough labeled rows to train (need at least 10).")
-    X_cols = ["Conductivity (µS/cm)"] + (["pH"] if use_ph else [])
-    X = d[X_cols].values
-    y = d["Total Hardness (ppm)"].values
-    test_size = max(3, int(0.2*len(d)))
-    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=42)
-    model = RandomForestRegressor(n_estimators=600, random_state=42)
-    model.fit(Xtr, ytr)
-    yhat = model.predict(Xte)
-    metrics = {
-        "Test_R2": float(r2_score(yte, yhat)),
-        "Test_MAE": float(mean_absolute_error(yte, yhat)),
-        "Test_RMSE": float(rmse(yte, yhat)),
-        "n_trainable_rows": int(len(d)),
-        "features": X_cols
+def load_initial_data():
+    """Load your initial water testing data"""
+    # Your initial dataset (replace with actual data loading)
+    initial_data = {
+        'Date': ['23-06-25', '04-07-25', '09-07-25', '11-07-25', '16-07-25', 
+                '18-07-25', '23-07-25', '25-07-25', '30-07-25', '01-08-25',
+                '06-08-25', '08-08-25', '13-08-25', '15-08-25'],
+        'Conductivity': [4520, 4230, 4311, 4920, 4600, 4850, 5490, 4750, 4380, 4950,
+                        4650, 4420, 4780, 4560],
+        'pH': [7.74, 8.14, 7.95, 7.88, 8.23, 7.68, 8.45, 7.92, 8.12, 8.76,
+               8.34, 7.89, 8.01, 7.97],
+        'Total_Hardness': [1590, 1390, 1460, 1520, 1340, 1580, 1190, 1470, 1410, 1230,
+                          1350, 1490, 1440, 1380]
     }
-    # Fit on all for deployment
-    model.fit(X, y)
-    return model, X_cols, metrics
+    return pd.DataFrame(initial_data)
 
-def rf_std_prediction(model, X: np.ndarray):
+def save_model_and_data():
+    """Save the trained model and accumulated data"""
     try:
-        preds = np.stack([t.predict(X) for t in model.estimators_], axis=0)
-        return preds.mean(axis=0), preds.std(axis=0, ddof=1)
-    except Exception:
-        return model.predict(X), np.full((X.shape[0],), np.nan)
-
-# Sidebar
-st.sidebar.header("Model & Data")
-use_ph_flag = st.sidebar.checkbox("Include pH in training", value=True)
-bundle = load_model()
-data_df = load_data()
-
-if bundle is None:
-    st.sidebar.warning("No model yet. Train after importing or adding labeled data.")
-else:
-    st.sidebar.success("Loaded model from disk.")
-    st.sidebar.write("Features:", ", ".join(bundle.get("feature_columns", [])))
-    if bundle.get("metrics"):
-        with st.sidebar.expander("Stored model metrics"):
-            st.json(bundle["metrics"])
-
-if st.sidebar.button("Train / Retrain now"):
-    try:
-        model, feat_cols, metrics = train_model(data_df, use_ph=use_ph_flag)
-        bundle = package_model(model, feat_cols, metrics)
-        save_model(bundle)
-        st.sidebar.success("Model trained and saved.")
+        with open(MODEL_FILE, 'wb') as f:
+            pickle.dump(st.session_state.predictor.model, f)
+        with open(SCALER_FILE, 'wb') as f:
+            pickle.dump(st.session_state.predictor.scaler, f)
+        with open(POLY_FILE, 'wb') as f:
+            pickle.dump(st.session_state.predictor.poly_features, f)
+        if not st.session_state.training_data.empty:
+            st.session_state.training_data.to_csv(DATA_FILE, index=False)
     except Exception as e:
-        st.sidebar.error(f"Training failed: {e}")
+        st.error(f"Error saving model: {e}")
 
-auto_retrain = st.sidebar.checkbox("Auto-retrain after saving a labeled sample", value=True)
-
-st.markdown("---")
-col1, col2 = st.columns([1,1])
-
-with col1:
-    st.subheader("🔢 Predict")
-    c = st.number_input("Conductivity (µS/cm)", min_value=0.0, value=4500.0, step=10.0)
-    ph = st.number_input("pH (0–14)", min_value=0.0, max_value=14.0, value=8.0, step=0.01)
-    if st.button("Predict Total Hardness"):
-        if bundle is None:
-            st.error("No model found. Train a model first.")
-        else:
-            feat_cols = bundle["feature_columns"]
-            X_vals = []
-            for f in feat_cols:
-                if f.lower().startswith("conductivity"):
-                    X_vals.append(c)
-                elif f.lower() == "pH".lower():
-                    X_vals.append(ph)
-            X = np.array(X_vals, dtype=float).reshape(1, -1)
-            model = bundle["model"]
-            y_mean, y_std = rf_std_prediction(model, X)
-            y_pred = float(y_mean[0])
-            st.success(f"Predicted Total Hardness: **{y_pred:,.0f} ppm as CaCO₃**")
-            if not np.isnan(y_std[0]):
-                lo = y_pred - 1.96 * float(y_std[0]); hi = y_pred + 1.96 * float(y_std[0])
-                st.caption(f"Approx. uncertainty band: {lo:,.0f} – {hi:,.0f} ppm")
-            # log unlabeled
-            df = load_data()
-            row = {"timestamp": now_iso(), "Conductivity (µS/cm)": c, "pH": ph, "Total Hardness (ppm)": np.nan, "source": "prediction_only"}
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-            save_data(df)
-
-with col2:
-    st.subheader("🧪 Add Measured Result")
-    measured = st.number_input("Measured Total Hardness (ppm as CaCO₃)", min_value=0.0, value=0.0, step=1.0)
-    if st.button("Save labeled sample"):
-        if measured <= 0:
-            st.error("Measured value must be > 0.")
-        else:
-            df = load_data()
-            row = {"timestamp": now_iso(), "Conductivity (µS/cm)": c, "pH": ph, "Total Hardness (ppm)": measured, "source": "labeled"}
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-            save_data(df)
-            st.success("Labeled sample saved.")
-            if auto_retrain:
-                try:
-                    model, feat_cols, metrics = train_model(df, use_ph=use_ph_flag)
-                    bundle = package_model(model, feat_cols, metrics)
-                    save_model(bundle)
-                    st.info("Auto-retrained and saved.")
-                    with st.expander("New model metrics"):
-                        st.json(metrics)
-                except Exception as e:
-                    st.warning(f"Auto-retrain failed: {e}")
-
-st.markdown("---")
-st.subheader("📥 Import Dataset & Map Columns")
-st.caption("Upload a CSV and map its columns to required fields. Imported rows with target become training data; others are stored for future labeling.")
-up = st.file_uploader("Upload CSV", type=["csv"])
-if up is not None:
+def load_model_and_data():
+    """Load previously saved model and data"""
     try:
-        dfu = pd.read_csv(up)
-        st.write("Uploaded columns:", list(dfu.columns))
-        # Column mapping UI
-        col_cond = st.selectbox("Map conductivity column", dfu.columns, index=0)
-        col_ph = st.selectbox("Map pH column (optional)", dfu.columns, index=min(1, len(dfu.columns)-1))
-        col_th = st.selectbox("Map Total Hardness column (target, optional)", dfu.columns, index=min(2, len(dfu.columns)-1))
-        if st.button("Import rows"):
-            # Build standardized frame
-            d = pd.DataFrame({
-                "timestamp": now_iso(),
-                "Conductivity (µS/cm)": pd.to_numeric(dfu[col_cond], errors="coerce"),
-                "pH": pd.to_numeric(dfu[col_ph], errors="coerce"),
-                "Total Hardness (ppm)": pd.to_numeric(dfu[col_th], errors="coerce")
-            })
-            # Determine source label
-            d["source"] = np.where(d["Total Hardness (ppm)"].notna(), "import_labeled", "import_unlabeled")
-            base = load_data()
-            merged = pd.concat([base, d], ignore_index=True)
-            save_data(merged)
-            st.success(f"Imported {len(d)} rows into persistent store.")
+        if os.path.exists(MODEL_FILE) and os.path.exists(SCALER_FILE):
+            with open(MODEL_FILE, 'rb') as f:
+                st.session_state.predictor.model = pickle.load(f)
+            with open(SCALER_FILE, 'rb') as f:
+                st.session_state.predictor.scaler = pickle.load(f)
+            if os.path.exists(POLY_FILE):
+                with open(POLY_FILE, 'rb') as f:
+                    st.session_state.predictor.poly_features = pickle.load(f)
+        
+        if os.path.exists(DATA_FILE):
+            st.session_state.training_data = pd.read_csv(DATA_FILE)
+        else:
+            st.session_state.training_data = load_initial_data()
+            
     except Exception as e:
-        st.error(f"Import failed: {e}")
+        st.error(f"Error loading model: {e}")
+        st.session_state.training_data = load_initial_data()
 
-st.markdown("---")
-st.subheader("📊 Data Browser (tail)")
-st.dataframe(load_data().tail(50), use_container_width=True)
+def train_initial_model():
+    """Train the model with initial data"""
+    if st.session_state.training_data.empty:
+        return
+    
+    # Prepare features
+    X = []
+    y = st.session_state.training_data['Total_Hardness'].values
+    
+    for _, row in st.session_state.training_data.iterrows():
+        features = st.session_state.predictor.create_features(row['Conductivity'], row['pH'])
+        X.append(features[0])
+    
+    X = np.array(X)
+    
+    # Train model
+    model_name, score = st.session_state.predictor.train_model(X, y)
+    
+    return model_name, score
+
+# Main Streamlit App
+def main():
+    st.set_page_config(page_title="Water Hardness Predictor", page_icon="💧", layout="wide")
+    
+    st.title("💧 Water Hardness Prediction System")
+    st.markdown("**Predict Total Hardness from Conductivity and pH with Continuous Learning**")
+    
+    # Load model and data
+    load_model_and_data()
+    
+    # Sidebar for model management
+    st.sidebar.header("🔧 Model Management")
+    
+    # Initialize/retrain model
+    if st.sidebar.button("🚀 Train/Retrain Model"):
+        with st.spinner("Training model..."):
+            model_name, score = train_initial_model()
+            save_model_and_data()
+            st.sidebar.success(f"Model trained: {model_name}")
+            st.sidebar.info(f"Cross-validation R² Score: {score:.3f}")
+    
+    # Model status
+    if st.session_state.predictor.model is not None:
+        st.sidebar.success("✅ Model Ready")
+        st.sidebar.info(f"Training Data Points: {len(st.session_state.training_data)}")
+    else:
+        st.sidebar.warning("❌ Model Not Trained")
+        st.sidebar.info("Click 'Train/Retrain Model' to start")
+    
+    # Main content tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["🎯 Prediction", "📊 Data Analysis", "📈 Model Performance", "💾 Data Management"])
+    
+    with tab1:
+        st.header("Make Predictions")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            conductivity = st.number_input(
+                "Conductivity (µS/cm)", 
+                min_value=1000.0, 
+                max_value=10000.0, 
+                value=4500.0,
+                step=50.0,
+                help="Typical range: 4000-5500 µS/cm"
+            )
+            
+            ph = st.number_input(
+                "pH", 
+                min_value=6.0, 
+                max_value=10.0, 
+                value=8.0,
+                step=0.1,
+                help="Typical range: 7.5-8.5"
+            )
+        
+        with col2:
+            if st.button("🔮 Predict Hardness", type="primary"):
+                if st.session_state.predictor.model is not None:
+                    prediction = st.session_state.predictor.predict(conductivity, ph)
+                    
+                    st.success(f"**Predicted Total Hardness: {prediction:.0f} ppm**")
+                    
+                    # Store prediction for potential feedback
+                    st.session_state.predictions_made.append({
+                        'timestamp': datetime.now(),
+                        'conductivity': conductivity,
+                        'ph': ph,
+                        'predicted_hardness': prediction
+                    })
+                    
+                    # Confidence indicator (simplified)
+                    if 4200 <= conductivity <= 5000 and 7.5 <= ph <= 8.5:
+                        st.info("🎯 High confidence - values within training range")
+                    else:
+                        st.warning("⚠️ Lower confidence - extrapolating beyond training data")
+                else:
+                    st.error("Please train the model first!")
+        
+        # Feedback section
+        if st.session_state.predictions_made:
+            st.subheader("📝 Provide Feedback")
+            st.write("Help improve the model by providing actual measurements:")
+            
+            with st.expander("Add Actual Measurement"):
+                actual_hardness = st.number_input(
+                    "Actual Total Hardness (ppm)", 
+                    min_value=500.0, 
+                    max_value=3000.0, 
+                    value=1400.0
+                )
+                
+                if st.button("✅ Add to Training Data"):
+                    if st.session_state.predictions_made:
+                        last_prediction = st.session_state.predictions_made[-1]
+                        
+                        # Add to training data
+                        new_row = pd.DataFrame({
+                            'Date': [datetime.now().strftime('%d-%m-%y')],
+                            'Conductivity': [last_prediction['conductivity']],
+                            'pH': [last_prediction['ph']],
+                            'Total_Hardness': [actual_hardness]
+                        })
+                        
+                        st.session_state.training_data = pd.concat([
+                            st.session_state.training_data, new_row
+                        ], ignore_index=True)
+                        
+                        # Retrain model with new data
+                        with st.spinner("Updating model..."):
+                            train_initial_model()
+                            save_model_and_data()
+                        
+                        st.success("✅ Data added and model updated!")
+                        st.balloons()
+    
+    with tab2:
+        st.header("Data Analysis")
+        
+        if not st.session_state.training_data.empty:
+            # Data overview
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Total Records", len(st.session_state.training_data))
+            
+            with col2:
+                avg_hardness = st.session_state.training_data['Total_Hardness'].mean()
+                st.metric("Average Hardness", f"{avg_hardness:.0f} ppm")
+            
+            with col3:
+                correlation = st.session_state.training_data[['Conductivity', 'Total_Hardness']].corr().iloc[0,1]
+                st.metric("Conductivity Correlation", f"{correlation:.3f}")
+            
+            # Visualizations
+            fig = make_subplots(
+                rows=2, cols=2,
+                subplot_titles=('Hardness vs Conductivity', 'Hardness vs pH', 
+                              'Data Distribution', 'Hardness Over Time')
+            )
+            
+            # Scatter plots
+            fig.add_trace(
+                go.Scatter(x=st.session_state.training_data['Conductivity'], 
+                          y=st.session_state.training_data['Total_Hardness'],
+                          mode='markers', name='Hardness vs Conductivity'),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(x=st.session_state.training_data['pH'], 
+                          y=st.session_state.training_data['Total_Hardness'],
+                          mode='markers', name='Hardness vs pH'),
+                row=1, col=2
+            )
+            
+            # Distribution
+            fig.add_trace(
+                go.Histogram(x=st.session_state.training_data['Total_Hardness'], 
+                           name='Hardness Distribution'),
+                row=2, col=1
+            )
+            
+            # Time series
+            fig.add_trace(
+                go.Scatter(x=st.session_state.training_data.index, 
+                          y=st.session_state.training_data['Total_Hardness'],
+                          mode='lines+markers', name='Hardness Over Time'),
+                row=2, col=2
+            )
+            
+            fig.update_layout(height=600, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Data table
+            st.subheader("Training Data")
+            st.dataframe(st.session_state.training_data, use_container_width=True)
+    
+    with tab3:
+        st.header("Model Performance")
+        
+        if st.session_state.predictor.model is not None and len(st.session_state.training_data) > 1:
+            # Make predictions on training data
+            X = []
+            for _, row in st.session_state.training_data.iterrows():
+                features = st.session_state.predictor.create_features(row['Conductivity'], row['pH'])
+                X.append(features[0])
+            
+            X = np.array(X)
+            X_scaled = st.session_state.predictor.scaler.transform(X)
+            y_true = st.session_state.training_data['Total_Hardness'].values
+            y_pred = st.session_state.predictor.model.predict(X_scaled)
+            
+            # Calculate metrics
+            mse = mean_squared_error(y_true, y_pred)
+            rmse = np.sqrt(mse)
+            mae = mean_absolute_error(y_true, y_pred)
+            r2 = r2_score(y_true, y_pred)
+            
+            # Display metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("R² Score", f"{r2:.3f}")
+            with col2:
+                st.metric("RMSE", f"{rmse:.1f} ppm")
+            with col3:
+                st.metric("MAE", f"{mae:.1f} ppm")
+            with col4:
+                st.metric("MSE", f"{mse:.1f}")
+            
+            # Prediction vs Actual plot
+            fig = go.Figure()
+            
+            # Perfect prediction line
+            min_val = min(min(y_true), min(y_pred))
+            max_val = max(max(y_true), max(y_pred))
+            fig.add_trace(go.Scatter(
+                x=[min_val, max_val], 
+                y=[min_val, max_val],
+                mode='lines', 
+                name='Perfect Prediction',
+                line=dict(dash='dash', color='red')
+            ))
+            
+            # Actual vs predicted
+            fig.add_trace(go.Scatter(
+                x=y_true, 
+                y=y_pred,
+                mode='markers',
+                name='Predictions',
+                text=[f"Point {i+1}" for i in range(len(y_true))],
+                hovertemplate="Actual: %{x}<br>Predicted: %{y}<extra></extra>"
+            ))
+            
+            fig.update_layout(
+                title="Predicted vs Actual Hardness",
+                xaxis_title="Actual Hardness (ppm)",
+                yaxis_title="Predicted Hardness (ppm)",
+                height=500
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Residuals plot
+            residuals = y_true - y_pred
+            
+            fig_residuals = go.Figure()
+            fig_residuals.add_trace(go.Scatter(
+                x=y_pred,
+                y=residuals,
+                mode='markers',
+                name='Residuals'
+            ))
+            fig_residuals.add_hline(y=0, line_dash="dash", line_color="red")
+            fig_residuals.update_layout(
+                title="Residuals Plot",
+                xaxis_title="Predicted Hardness (ppm)",
+                yaxis_title="Residuals (ppm)",
+                height=400
+            )
+            
+            st.plotly_chart(fig_residuals, use_container_width=True)
+        
+        else:
+            st.info("Train the model to see performance metrics")
+    
+    with tab4:
+        st.header("Data Management")
+        
+        # Upload new data
+        st.subheader("📤 Upload Training Data")
+        uploaded_file = st.file_uploader(
+            "Choose a CSV file", 
+            type="csv",
+            help="CSV should have columns: Conductivity, pH, Total_Hardness"
+        )
+        
+        if uploaded_file is not None:
+            try:
+                new_data = pd.read_csv(uploaded_file)
+                st.write("Preview of uploaded data:")
+                st.dataframe(new_data.head())
+                
+                if st.button("📥 Add to Training Data"):
+                    # Validate columns
+                    required_cols = ['Conductivity', 'pH', 'Total_Hardness']
+                    if all(col in new_data.columns for col in required_cols):
+                        st.session_state.training_data = pd.concat([
+                            st.session_state.training_data, new_data
+                        ], ignore_index=True)
+                        st.success(f"Added {len(new_data)} records to training data")
+                    else:
+                        st.error(f"CSV must contain columns: {required_cols}")
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
+        
+        # Download current data
+        st.subheader("📥 Download Data")
+        if not st.session_state.training_data.empty:
+            csv = st.session_state.training_data.to_csv(index=False)
+            st.download_button(
+                label="Download Training Data as CSV",
+                data=csv,
+                file_name=f"water_hardness_data_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        
+        # Clear data
+        st.subheader("🗑️ Reset")
+        if st.button("🔄 Reset to Initial Data", type="secondary"):
+            st.session_state.training_data = load_initial_data()
+            st.success("Data reset to initial dataset")
+        
+        if st.button("❌ Clear All Data", type="secondary"):
+            st.session_state.training_data = pd.DataFrame()
+            st.session_state.predictor = WaterHardnessPredictor()
+            st.warning("All data cleared")
+
+if __name__ == "__main__":
+    main()
