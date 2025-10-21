@@ -11,689 +11,746 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
 from sklearn.svm import SVR
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.model_selection import cross_val_score, LeaveOneOut
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, mean_absolute_percentage_error
-from scipy import stats
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import warnings
 warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="Water Hardness Predictor", page_icon="💧", layout="wide")
+# Configuration
+MODEL_DIR = 'models'
+DATA_FILE = 'training_data.csv'
 
-# Session state initialization
-if 'data' not in st.session_state:
-    st.session_state.data = None
-if 'models' not in st.session_state:
-    st.session_state.models = {}
-if 'best_configs' not in st.session_state:
-    st.session_state.best_configs = {}
-if 'correlation_analysis' not in st.session_state:
-    st.session_state.correlation_analysis = {}
-
-def load_data(uploaded_file):
-    """Load and process uploaded CSV file"""
-    try:
-        df = pd.read_csv(uploaded_file)
+class WaterQualityPredictor:
+    def __init__(self):
+        self.models = {}  # Will store models for each target
+        self.scalers = {}
+        self.feature_configs = {}  # Best feature combination for each target
+        self.model_names = {}
         
-        # Clean column names
-        df.columns = df.columns.str.strip()
+    def calculate_correlations(self, df, predictors, target):
+        """Calculate correlations between predictors and target"""
+        correlations = {}
+        for predictor in predictors:
+            if predictor in df.columns and target in df.columns:
+                valid_data = df[[predictor, target]].dropna()
+                if len(valid_data) > 1:
+                    corr = valid_data[predictor].corr(valid_data[target])
+                    correlations[predictor] = corr
+        return correlations
+    
+    def create_engineered_features(self, df, feature_combo):
+        """Create engineered features based on selected combination"""
+        X = df[feature_combo].copy()
         
-        # Convert numeric columns
-        numeric_cols = ['Calculated Hardness (ppm)', 'Total Hardness (ppm)', 'Conductivity (µS/cm)', 
-                       'pH', 'Chloride (ppm)', 'Alkalinity (ppm)', 'Turbidity (FAU)', 
-                       'Aluminum (ppm)', 'Temp (°C)', 'Biocide (ppm)', 'Sulfates (ppm)', 
-                       'Iron (ppm)', 'Antiscalant (PTSA ppb)', 'Antiscalant (>0.1)']
+        # Add polynomial features
+        if len(feature_combo) == 2:
+            # Interaction term
+            X[f'{feature_combo[0]}_x_{feature_combo[1]}'] = df[feature_combo[0]] * df[feature_combo[1]]
+            # Ratio
+            X[f'{feature_combo[0]}_div_{feature_combo[1]}'] = df[feature_combo[0]] / (df[feature_combo[1]] + 1e-6)
         
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+        # Add squared terms
+        for col in feature_combo:
+            X[f'{col}_squared'] = df[col] ** 2
+            if df[col].min() > 0:
+                X[f'{col}_log'] = np.log(df[col] + 1)
         
-        return df
-    except Exception as e:
-        st.error(f"Error loading file: {e}")
-        return None
-
-def calculate_correlations(df, predictors, target):
-    """Calculate correlation coefficients"""
-    correlations = {}
-    p_values = {}
+        return X
     
-    for predictor in predictors:
-        if predictor in df.columns and target in df.columns:
-            valid_data = df[[predictor, target]].dropna()
-            if len(valid_data) >= 3:
-                corr, p_val = stats.pearsonr(valid_data[predictor], valid_data[target])
-                correlations[predictor] = corr
-                p_values[predictor] = p_val
+    def test_all_combinations(self, df, target, available_predictors):
+        """Test all combinations of predictors to find the best"""
+        from itertools import combinations
+        
+        results = []
+        
+        # Test individual predictors
+        for predictor in available_predictors:
+            if predictor in df.columns:
+                score, model_name = self._test_combination(df, [predictor], target)
+                results.append({
+                    'features': [predictor],
+                    'score': score,
+                    'model': model_name,
+                    'n_features': 1
+                })
+        
+        # Test pairs of predictors
+        if len(available_predictors) >= 2:
+            for combo in combinations(available_predictors, 2):
+                if all(c in df.columns for c in combo):
+                    score, model_name = self._test_combination(df, list(combo), target)
+                    results.append({
+                        'features': list(combo),
+                        'score': score,
+                        'model': model_name,
+                        'n_features': 2
+                    })
+        
+        # Test all predictors together
+        if len(available_predictors) >= 3:
+            valid_predictors = [p for p in available_predictors if p in df.columns]
+            if len(valid_predictors) >= 3:
+                score, model_name = self._test_combination(df, valid_predictors, target)
+                results.append({
+                    'features': valid_predictors,
+                    'score': score,
+                    'model': model_name,
+                    'n_features': len(valid_predictors)
+                })
+        
+        # Sort by score
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results
     
-    return correlations, p_values
-
-def create_features(df, predictor_cols):
-    """Create engineered features"""
-    X = df[predictor_cols].copy()
-    
-    # Polynomial features
-    if len(predictor_cols) >= 2:
-        X['interaction'] = df[predictor_cols[0]] * df[predictor_cols[1]]
-        X['ratio'] = df[predictor_cols[0]] / (df[predictor_cols[1]] + 1e-6)
-    
-    # Add squared and log terms
-    for col in predictor_cols:
-        X[f'{col}_squared'] = df[col] ** 2
-        if df[col].min() > 0:
-            X[f'{col}_log'] = np.log(df[col] + 1)
-    
-    return X
-
-def evaluate_model_combination(df, predictors, target, algorithm):
-    """Evaluate a specific predictor combination with an algorithm"""
-    
-    # Filter valid data
-    required_cols = predictors + [target]
-    valid_data = df[required_cols].dropna()
-    
-    if len(valid_data) < 3:
-        return None
-    
-    # Create features
-    X = create_features(valid_data, predictors)
-    y = valid_data[target].values
-    
-    # Scale features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    # Define model
-    models_dict = {
-        'Random Forest': RandomForestRegressor(n_estimators=200, max_depth=8, min_samples_split=2, 
-                                               min_samples_leaf=1, random_state=42, n_jobs=-1),
-        'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, learning_rate=0.05, 
-                                                       max_depth=4, random_state=42),
-        'Ridge': Ridge(alpha=1.0),
-        'Lasso': Lasso(alpha=0.1),
-        'SVR': SVR(kernel='rbf', C=100, gamma='scale'),
-        'Linear': LinearRegression()
-    }
-    
-    model = models_dict.get(algorithm)
-    if model is None:
-        return None
-    
-    try:
-        # Use Leave-One-Out cross-validation for small datasets
-        if len(valid_data) < 10:
-            loo = LeaveOneOut()
-            predictions = []
-            actuals = []
-            
-            for train_idx, test_idx in loo.split(X_scaled):
-                X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
-                y_train, y_test = y[train_idx], y[test_idx]
+    def _test_combination(self, df, features, target):
+        """Test a specific combination of features"""
+        # Filter valid data
+        valid_cols = features + [target]
+        valid_data = df[valid_cols].dropna()
+        
+        if len(valid_data) < 3:
+            return -999, 'Insufficient Data'
+        
+        # Create features
+        X = self.create_engineered_features(valid_data, features)
+        y = valid_data[target].values
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # Test multiple algorithms
+        algorithms = {
+            'Random Forest': RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1),
+            'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, random_state=42),
+            'Ridge': Ridge(alpha=1.0),
+            'Lasso': Lasso(alpha=1.0),
+            'SVR': SVR(kernel='rbf'),
+            'Linear': LinearRegression()
+        }
+        
+        best_score = -999
+        best_model_name = 'None'
+        
+        for name, model in algorithms.items():
+            try:
+                if len(valid_data) < 5:
+                    # Too few points for cross-validation
+                    model.fit(X_scaled, y)
+                    y_pred = model.predict(X_scaled)
+                    score = r2_score(y, y_pred)
+                else:
+                    # Use cross-validation
+                    scores = cross_val_score(model, X_scaled, y, cv=min(5, len(valid_data)), 
+                                           scoring='r2', n_jobs=-1)
+                    score = np.mean(scores)
                 
-                model_clone = models_dict.get(algorithm)
-                model_clone.fit(X_train, y_train)
-                pred = model_clone.predict(X_test)
-                
-                predictions.append(pred[0])
-                actuals.append(y_test[0])
-            
-            predictions = np.array(predictions)
-            actuals = np.array(actuals)
-            
-            r2 = r2_score(actuals, predictions)
-            rmse = np.sqrt(mean_squared_error(actuals, predictions))
-            mae = mean_absolute_error(actuals, predictions)
-            
-        else:
-            # Regular cross-validation
-            cv_scores = cross_val_score(model, X_scaled, y, cv=5, scoring='r2')
-            r2 = np.mean(cv_scores)
-            
-            # Fit for RMSE and MAE
-            model.fit(X_scaled, y)
-            y_pred = model.predict(X_scaled)
-            rmse = np.sqrt(mean_squared_error(y, y_pred))
-            mae = mean_absolute_error(y, y_pred)
+                if score > best_score:
+                    best_score = score
+                    best_model_name = name
+            except:
+                continue
         
-        return {
+        return best_score, best_model_name
+    
+    def train_model(self, df, target, feature_combo, algorithm='Random Forest'):
+        """Train the final model with best configuration"""
+        # Filter valid data
+        valid_cols = feature_combo + [target]
+        valid_data = df[valid_cols].dropna()
+        
+        if len(valid_data) < 2:
+            return None, None, "Insufficient data"
+        
+        # Create features
+        X = self.create_engineered_features(valid_data, feature_combo)
+        y = valid_data[target].values
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # Select algorithm
+        algorithms = {
+            'Random Forest': RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1),
+            'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, random_state=42),
+            'Ridge': Ridge(alpha=1.0),
+            'Lasso': Lasso(alpha=1.0),
+            'SVR': SVR(kernel='rbf', C=100, gamma='scale'),
+            'Linear': LinearRegression()
+        }
+        
+        model = algorithms.get(algorithm, RandomForestRegressor(n_estimators=200, random_state=42))
+        
+        # Train
+        model.fit(X_scaled, y)
+        
+        # Calculate metrics
+        y_pred = model.predict(X_scaled)
+        r2 = r2_score(y, y_pred)
+        rmse = np.sqrt(mean_squared_error(y, y_pred))
+        mae = mean_absolute_error(y, y_pred)
+        
+        # Store
+        self.models[target] = model
+        self.scalers[target] = scaler
+        self.feature_configs[target] = feature_combo
+        self.model_names[target] = algorithm
+        
+        metrics = {
             'r2': r2,
             'rmse': rmse,
             'mae': mae,
-            'n_samples': len(valid_data),
-            'model': model,
-            'scaler': scaler,
-            'feature_names': X.columns.tolist()
+            'n_samples': len(valid_data)
         }
+        
+        return model, scaler, metrics
     
+    def predict(self, input_data, target):
+        """Make prediction for a target variable"""
+        if target not in self.models:
+            return None
+        
+        feature_combo = self.feature_configs[target]
+        
+        # Create input dataframe
+        input_df = pd.DataFrame([input_data])
+        
+        # Create engineered features
+        X = self.create_engineered_features(input_df, feature_combo)
+        
+        # Scale
+        X_scaled = self.scalers[target].transform(X)
+        
+        # Predict
+        prediction = self.models[target].predict(X_scaled)
+        
+        return prediction[0]
+
+# Initialize session state
+if 'predictor' not in st.session_state:
+    st.session_state.predictor = WaterQualityPredictor()
+    st.session_state.training_data = pd.DataFrame()
+    st.session_state.correlation_results = {}
+    st.session_state.combination_results = {}
+
+def load_data_from_upload(uploaded_file):
+    """Load data from uploaded CSV"""
+    try:
+        df = pd.read_csv(uploaded_file)
+        
+        # Try to standardize column names
+        column_mapping = {
+            'conductivity': 'EC',
+            'conductivity (µs/cm)': 'EC',
+            'conductivity (us/cm)': 'EC',
+            'ec': 'EC',
+            'ph': 'pH',
+            'total hardness': 'Total_Hardness',
+            'total hardness (ppm)': 'Total_Hardness',
+            'total_hardness': 'Total_Hardness',
+            'calcium hardness': 'Calcium_Hardness',
+            'calcium hardness (ppm)': 'Calcium_Hardness',
+            'calcium_hardness': 'Calcium_Hardness',
+            'calculated hardness (ppm)': 'Calcium_Hardness',
+        }
+        
+        # Rename columns
+        df.columns = df.columns.str.strip().str.lower()
+        for old_name, new_name in column_mapping.items():
+            if old_name in df.columns:
+                df.rename(columns={old_name: new_name}, inplace=True)
+        
+        return df
     except Exception as e:
+        st.error(f"Error loading data: {e}")
         return None
 
-def train_final_model(df, predictors, target, algorithm):
-    """Train the final model on all data"""
-    required_cols = predictors + [target]
-    valid_data = df[required_cols].dropna()
+def save_models():
+    """Save all trained models"""
+    if not os.path.exists(MODEL_DIR):
+        os.makedirs(MODEL_DIR)
     
-    if len(valid_data) < 2:
-        return None
-    
-    # Create features
-    X = create_features(valid_data, predictors)
-    y = valid_data[target].values
-    
-    # Scale
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    # Define and train model
-    models_dict = {
-        'Random Forest': RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42, n_jobs=-1),
-        'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, learning_rate=0.05, random_state=42),
-        'Ridge': Ridge(alpha=1.0),
-        'Lasso': Lasso(alpha=0.1),
-        'SVR': SVR(kernel='rbf', C=100, gamma='scale'),
-        'Linear': LinearRegression()
-    }
-    
-    model = models_dict.get(algorithm)
-    if model is None:
-        return None
-    
-    model.fit(X_scaled, y)
-    
-    # Calculate training metrics
-    y_pred = model.predict(X_scaled)
-    metrics = {
-        'r2': r2_score(y, y_pred),
-        'rmse': np.sqrt(mean_squared_error(y, y_pred)),
-        'mae': mean_absolute_error(y, y_pred),
-        'n_samples': len(valid_data)
-    }
-    
-    return {
-        'model': model,
-        'scaler': scaler,
-        'predictors': predictors,
-        'feature_names': X.columns.tolist(),
-        'metrics': metrics,
-        'y_true': y,
-        'y_pred': y_pred
-    }
+    try:
+        with open(os.path.join(MODEL_DIR, 'predictor.pkl'), 'wb') as f:
+            pickle.dump(st.session_state.predictor, f)
+        if not st.session_state.training_data.empty:
+            st.session_state.training_data.to_csv(DATA_FILE, index=False)
+    except Exception as e:
+        st.error(f"Error saving models: {e}")
 
-# ========== MAIN APP ==========
+def load_models():
+    """Load previously saved models"""
+    try:
+        predictor_path = os.path.join(MODEL_DIR, 'predictor.pkl')
+        if os.path.exists(predictor_path):
+            with open(predictor_path, 'rb') as f:
+                st.session_state.predictor = pickle.load(f)
+        
+        if os.path.exists(DATA_FILE):
+            st.session_state.training_data = pd.read_csv(DATA_FILE)
+    except Exception as e:
+        st.error(f"Error loading models: {e}")
 
-st.title("💧 Water Hardness Prediction System")
-st.markdown("**Comprehensive ML System for Total & Calcium Hardness Prediction**")
-
-# Sidebar
-st.sidebar.header("📁 Data Upload")
-uploaded_file = st.sidebar.file_uploader("Upload Water Testing CSV", type=['csv'])
-
-if uploaded_file is not None:
-    df = load_data(uploaded_file)
-    if df is not None:
-        st.session_state.data = df
-        st.sidebar.success(f"✅ Loaded {len(df)} records")
-        st.sidebar.info(f"Columns: {len(df.columns)}")
-
-# Main content
-if st.session_state.data is not None:
-    df = st.session_state.data
+# Main App
+def main():
+    st.set_page_config(page_title="Water Quality Predictor", page_icon="💧", layout="wide")
     
-    # Define predictor and target options
-    predictor_options = {
-        'Conductivity (µS/cm)': 'Conductivity (µS/cm)',
-        'pH': 'pH',
-        'Both (Conductivity + pH)': ['Conductivity (µS/cm)', 'pH']
-    }
+    st.title("💧 Advanced Water Quality Prediction System")
+    st.markdown("**Predict Total Hardness & Calcium Hardness from pH, EC, or Both - Automatic Best Model Selection**")
     
-    target_options = {
-        'Total Hardness (ppm)': 'Total Hardness (ppm)',
-        'Calculated Hardness (ppm)': 'Calculated Hardness (ppm)',
-        'Both': ['Total Hardness (ppm)', 'Calculated Hardness (ppm)']
-    }
+    # Load existing models
+    load_models()
     
-    # Tabs
+    # Sidebar
+    st.sidebar.header("📊 Data Management")
+    
+    # File upload
+    uploaded_file = st.sidebar.file_uploader("Upload Water Testing Data (CSV)", type=['csv'])
+    
+    if uploaded_file is not None:
+        df = load_data_from_upload(uploaded_file)
+        if df is not None:
+            st.session_state.training_data = df
+            st.sidebar.success(f"✅ Loaded {len(df)} records")
+            
+            # Show detected columns
+            st.sidebar.info(f"Detected columns: {', '.join(df.columns.tolist())}")
+    
+    # Algorithm selection
+    st.sidebar.header("🤖 Model Configuration")
+    algorithm_choice = st.sidebar.selectbox(
+        "Preferred Algorithm",
+        ['Random Forest', 'Gradient Boosting', 'Ridge', 'SVR', 'Lasso', 'Linear'],
+        index=0
+    )
+    
+    # Main tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 Data Overview", 
-        "🔍 Correlation Analysis",
-        "🤖 Model Comparison",
-        "🎯 Best Models & Training",
-        "🔮 Predictions"
+        "📈 Correlation Analysis", 
+        "🎯 Model Training", 
+        "🔮 Predictions",
+        "📊 Performance",
+        "💾 Data View"
     ])
     
     with tab1:
-        st.header("Data Overview")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Records", len(df))
-        with col2:
-            st.metric("Total Hardness Avg", f"{df['Total Hardness (ppm)'].mean():.0f} ppm" if 'Total Hardness (ppm)' in df.columns else "N/A")
-        with col3:
-            st.metric("Calcium Hardness Avg", f"{df['Calculated Hardness (ppm)'].mean():.0f} ppm" if 'Calculated Hardness (ppm)' in df.columns else "N/A")
-        with col4:
-            st.metric("pH Range", f"{df['pH'].min():.2f} - {df['pH'].max():.2f}" if 'pH' in df.columns else "N/A")
-        
-        st.subheader("Raw Data")
-        st.dataframe(df, use_container_width=True)
-        
-        st.subheader("Statistical Summary")
-        st.dataframe(df.describe(), use_container_width=True)
-        
-        # Distribution plots
-        st.subheader("Data Distributions")
-        
-        fig = make_subplots(rows=2, cols=2, 
-                           subplot_titles=('Total Hardness', 'Calculated Hardness (Calcium)', 
-                                         'Conductivity', 'pH'))
-        
-        if 'Total Hardness (ppm)' in df.columns:
-            fig.add_trace(go.Histogram(x=df['Total Hardness (ppm)'], name='Total Hardness'), row=1, col=1)
-        
-        if 'Calculated Hardness (ppm)' in df.columns:
-            fig.add_trace(go.Histogram(x=df['Calculated Hardness (ppm)'], name='Calcium Hardness'), row=1, col=2)
-        
-        if 'Conductivity (µS/cm)' in df.columns:
-            fig.add_trace(go.Histogram(x=df['Conductivity (µS/cm)'], name='Conductivity'), row=2, col=1)
-        
-        if 'pH' in df.columns:
-            fig.add_trace(go.Histogram(x=df['pH'], name='pH'), row=2, col=2)
-        
-        fig.update_layout(height=600, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with tab2:
         st.header("Correlation Analysis")
         
-        # Correlation heatmap
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        
-        if len(numeric_cols) > 2:
-            st.subheader("Correlation Heatmap")
+        if not st.session_state.training_data.empty:
+            df = st.session_state.training_data
             
-            corr_matrix = df[numeric_cols].corr()
+            # Identify available columns
+            potential_predictors = ['EC', 'pH', 'Conductivity (µS/cm)', 'conductivity', 'ph']
+            potential_targets = ['Total_Hardness', 'Calcium_Hardness', 'Total Hardness (ppm)', 'Calculated Hardness (ppm)']
             
-            fig = px.imshow(corr_matrix,
-                           text_auto='.3f',
-                           aspect='auto',
-                           color_continuous_scale='RdBu_r',
-                           zmin=-1, zmax=1)
+            available_predictors = [col for col in df.columns if any(p.lower() in col.lower() for p in ['ec', 'ph', 'conductivity'])]
+            available_targets = [col for col in df.columns if any(t.lower() in col.lower() for t in ['hardness', 'calcium'])]
             
-            fig.update_layout(height=600)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Detailed correlation analysis
-        st.subheader("Predictor vs Target Correlations")
-        
-        predictors = ['Conductivity (µS/cm)', 'pH']
-        targets = ['Total Hardness (ppm)', 'Calculated Hardness (ppm)']
-        
-        for target in targets:
-            if target in df.columns:
-                st.markdown(f"### {target}")
+            st.subheader("Available Variables")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**Predictors:**", available_predictors)
+            with col2:
+                st.write("**Targets:**", available_targets)
+            
+            if len(available_predictors) > 0 and len(available_targets) > 0:
+                # Calculate correlations
+                st.subheader("Correlation Matrix")
                 
-                correlations, p_values = calculate_correlations(df, predictors, target)
+                all_numeric_cols = available_predictors + available_targets
+                numeric_df = df[all_numeric_cols].select_dtypes(include=[np.number])
                 
-                if correlations:
-                    # Create bar chart
-                    fig = go.Figure()
+                if not numeric_df.empty:
+                    corr_matrix = numeric_df.corr()
                     
-                    colors = ['green' if abs(v) > 0.5 else 'orange' if abs(v) > 0.3 else 'red' 
-                             for v in correlations.values()]
-                    
-                    fig.add_trace(go.Bar(
-                        x=list(correlations.keys()),
-                        y=list(correlations.values()),
-                        text=[f"{v:.3f}<br>p={p_values.get(k, 0):.3f}" 
-                              for k, v in correlations.items()],
-                        textposition='auto',
-                        marker_color=colors
-                    ))
-                    
-                    fig.update_layout(
-                        title=f"Correlation with {target}",
-                        xaxis_title="Predictor",
-                        yaxis_title="Pearson Correlation Coefficient",
-                        height=400,
-                        yaxis_range=[-1, 1]
-                    )
-                    
+                    fig = px.imshow(corr_matrix, 
+                                   text_auto='.3f',
+                                   aspect="auto",
+                                   color_continuous_scale='RdBu_r',
+                                   title="Correlation Heatmap")
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # Interpretation
-                    best_pred = max(correlations.items(), key=lambda x: abs(x[1]))
-                    
-                    if abs(best_pred[1]) > 0.7:
-                        strength = "Strong"
-                        color = "green"
-                    elif abs(best_pred[1]) > 0.4:
-                        strength = "Moderate"
-                        color = "orange"
-                    else:
-                        strength = "Weak"
-                        color = "red"
-                    
-                    st.markdown(f"**Best Predictor:** {best_pred[0]} | **Correlation:** {best_pred[1]:.3f} | **Strength:** :{color}[{strength}]")
-                    
-                    # Scatter plots
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        if 'Conductivity (µS/cm)' in df.columns:
-                            fig = px.scatter(df, x='Conductivity (µS/cm)', y=target,
-                                           trendline="ols",
-                                           title=f"Conductivity vs {target}")
-                            st.plotly_chart(fig, use_container_width=True)
-                    
-                    with col2:
-                        if 'pH' in df.columns:
-                            fig = px.scatter(df, x='pH', y=target,
-                                           trendline="ols",
-                                           title=f"pH vs {target}")
-                            st.plotly_chart(fig, use_container_width=True)
-    
-    with tab3:
-        st.header("Model Comparison")
-        st.markdown("Test all predictor combinations and algorithms to find the best configuration")
-        
-        # Target selection
-        target_choice = st.selectbox("Select Target Variable", list(target_options.keys()))
-        
-        if st.button("🚀 Run Comprehensive Analysis", type="primary"):
-            targets_to_test = target_options[target_choice]
-            if not isinstance(targets_to_test, list):
-                targets_to_test = [targets_to_test]
-            
-            all_results = {}
-            
-            for target in targets_to_test:
-                if target not in df.columns:
-                    continue
-                
-                st.markdown(f"### Analyzing: {target}")
-                
-                results = []
-                
-                # Test all combinations
-                progress_bar = st.progress(0)
-                total_tests = len(predictor_options) * 6  # 6 algorithms
-                current = 0
-                
-                for pred_name, pred_cols in predictor_options.items():
-                    if not isinstance(pred_cols, list):
-                        pred_cols = [pred_cols]
-                    
-                    for algorithm in ['Random Forest', 'Gradient Boosting', 'Ridge', 'Lasso', 'SVR', 'Linear']:
-                        result = evaluate_model_combination(df, pred_cols, target, algorithm)
-                        
-                        if result is not None:
-                            results.append({
-                                'Predictors': pred_name,
-                                'Algorithm': algorithm,
-                                'R² Score': result['r2'],
-                                'RMSE': result['rmse'],
-                                'MAE': result['mae'],
-                                'Samples': result['n_samples']
-                            })
-                        
-                        current += 1
-                        progress_bar.progress(current / total_tests)
-                
-                progress_bar.empty()
-                
-                if results:
-                    results_df = pd.DataFrame(results)
-                    results_df = results_df.sort_values('R² Score', ascending=False)
-                    
-                    all_results[target] = results_df
-                    
-                    # Display results
-                    st.dataframe(results_df.style.background_gradient(subset=['R² Score'], cmap='RdYlGn')
-                                             .format({'R² Score': '{:.4f}', 'RMSE': '{:.2f}', 'MAE': '{:.2f}'}),
-                               use_container_width=True)
-                    
-                    # Highlight best
-                    best = results_df.iloc[0]
-                    st.success(f"🏆 **Best Configuration:** {best['Predictors']} + {best['Algorithm']} | R² = {best['R² Score']:.4f} | RMSE = {best['RMSE']:.2f}")
-                    
-                    # Visualization
-                    fig = px.bar(results_df.head(10), 
-                               x='Algorithm', y='R² Score',
-                               color='Predictors',
-                               barmode='group',
-                               title=f"Top 10 Configurations for {target}")
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Store best config
-                    st.session_state.best_configs[target] = {
-                        'predictors': best['Predictors'],
-                        'algorithm': best['Algorithm'],
-                        'r2': best['R² Score']
-                    }
-    
-    with tab4:
-        st.header("Train Best Models")
-        
-        if st.session_state.best_configs:
-            st.subheader("Recommended Configurations")
-            
-            for target, config in st.session_state.best_configs.items():
-                st.info(f"**{target}**: {config['predictors']} + {config['algorithm']} (R² = {config['r2']:.4f})")
-            
-            st.divider()
-            
-            if st.button("🎯 Train All Best Models", type="primary"):
-                for target, config in st.session_state.best_configs.items():
-                    st.markdown(f"### Training: {target}")
-                    
-                    # Get predictor columns
-                    pred_choice = config['predictors']
-                    predictors = predictor_options[pred_choice]
-                    if not isinstance(predictors, list):
-                        predictors = [predictors]
-                    
-                    # Train
-                    with st.spinner(f"Training {config['algorithm']}..."):
-                        result = train_final_model(df, predictors, target, config['algorithm'])
-                        
-                        if result is not None:
-                            st.session_state.models[target] = result
+                    # Individual correlations for each target
+                    for target in available_targets:
+                        if target in df.columns:
+                            st.subheader(f"Correlations with {target}")
+                            correlations = st.session_state.predictor.calculate_correlations(
+                                df, available_predictors, target
+                            )
                             
-                            # Display metrics
-                            col1, col2, col3, col4 = st.columns(4)
-                            with col1:
-                                st.metric("R² Score", f"{result['metrics']['r2']:.4f}")
-                            with col2:
-                                st.metric("RMSE", f"{result['metrics']['rmse']:.2f} ppm")
-                            with col3:
-                                st.metric("MAE", f"{result['metrics']['mae']:.2f} ppm")
-                            with col4:
-                                st.metric("Samples", result['metrics']['n_samples'])
-                            
-                            # Predictions vs Actual plot
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                fig = go.Figure()
-                                
-                                min_val = min(result['y_true'].min(), result['y_pred'].min())
-                                max_val = max(result['y_true'].max(), result['y_pred'].max())
-                                
-                                fig.add_trace(go.Scatter(
-                                    x=[min_val, max_val],
-                                    y=[min_val, max_val],
-                                    mode='lines',
-                                    name='Perfect Prediction',
-                                    line=dict(dash='dash', color='red')
-                                ))
-                                
-                                fig.add_trace(go.Scatter(
-                                    x=result['y_true'],
-                                    y=result['y_pred'],
-                                    mode='markers',
-                                    name='Predictions',
-                                    marker=dict(size=12, color='blue')
-                                ))
-                                
-                                fig.update_layout(
-                                    title="Predicted vs Actual",
-                                    xaxis_title="Actual (ppm)",
-                                    yaxis_title="Predicted (ppm)",
-                                    height=400
-                                )
-                                
-                                st.plotly_chart(fig, use_container_width=True)
-                            
-                            with col2:
-                                residuals = result['y_true'] - result['y_pred']
-                                
-                                fig = go.Figure()
-                                fig.add_trace(go.Scatter(
-                                    x=result['y_pred'],
-                                    y=residuals,
-                                    mode='markers',
-                                    marker=dict(size=12, color='blue')
-                                ))
-                                fig.add_hline(y=0, line_dash="dash", line_color="red")
-                                
-                                fig.update_layout(
-                                    title="Residuals Plot",
-                                    xaxis_title="Predicted (ppm)",
-                                    yaxis_title="Residuals (ppm)",
-                                    height=400
-                                )
-                                
-                                st.plotly_chart(fig, use_container_width=True)
-                            
-                            # Feature importance for tree-based models
-                            if hasattr(result['model'], 'feature_importances_'):
-                                st.subheader("Feature Importance")
-                                
-                                importances = result['model'].feature_importances_
-                                feature_names = result['feature_names']
-                                
-                                # Sort by importance
-                                indices = np.argsort(importances)[::-1]
-                                
+                            if correlations:
+                                # Create bar chart
                                 fig = go.Figure(data=[
                                     go.Bar(
-                                        x=[feature_names[i] for i in indices],
-                                        y=[importances[i] for i in indices]
+                                        x=list(correlations.keys()),
+                                        y=list(correlations.values()),
+                                        text=[f"{v:.3f}" for v in correlations.values()],
+                                        textposition='auto',
                                     )
                                 ])
-                                
                                 fig.update_layout(
-                                    title="Feature Importance",
-                                    xaxis_title="Feature",
-                                    yaxis_title="Importance",
+                                    title=f"Correlation with {target}",
+                                    xaxis_title="Predictor",
+                                    yaxis_title="Correlation Coefficient",
                                     height=400
                                 )
-                                
                                 st.plotly_chart(fig, use_container_width=True)
-                            
-                            st.success(f"✅ Model trained successfully for {target}!")
-                        else:
-                            st.error(f"Failed to train model for {target}")
-                
-                st.balloons()
+                                
+                                # Interpretation
+                                best_predictor = max(correlations.items(), key=lambda x: abs(x[1]))
+                                st.info(f"🎯 **Best single predictor:** {best_predictor[0]} (r = {best_predictor[1]:.3f})")
+            else:
+                st.warning("Please ensure your data has both predictors (EC, pH) and targets (Total Hardness, Calcium Hardness)")
         else:
-            st.info("👈 Run Model Comparison first to identify best configurations")
+            st.info("👆 Upload your water testing data to begin correlation analysis")
     
-    with tab5:
+    with tab2:
+        st.header("Model Training & Optimization")
+        
+        if not st.session_state.training_data.empty:
+            df = st.session_state.training_data
+            
+            # Detect columns
+            available_predictors = [col for col in df.columns if any(p.lower() in col.lower() for p in ['ec', 'ph', 'conductivity'])]
+            available_targets = [col for col in df.columns if any(t.lower() in col.lower() for t in ['hardness', 'calcium'])]
+            
+            if available_predictors and available_targets:
+                st.subheader("🔍 Test All Feature Combinations")
+                
+                if st.button("🚀 Find Best Model Configuration", type="primary"):
+                    results_dict = {}
+                    
+                    for target in available_targets:
+                        with st.spinner(f"Testing combinations for {target}..."):
+                            results = st.session_state.predictor.test_all_combinations(
+                                df, target, available_predictors
+                            )
+                            results_dict[target] = results
+                    
+                    st.session_state.combination_results = results_dict
+                    st.success("✅ Analysis complete!")
+                
+                # Display results
+                if st.session_state.combination_results:
+                    for target, results in st.session_state.combination_results.items():
+                        st.subheader(f"📊 Results for {target}")
+                        
+                        if results:
+                            # Create results dataframe
+                            results_df = pd.DataFrame([
+                                {
+                                    'Features': ' + '.join(r['features']),
+                                    'R² Score': f"{r['score']:.4f}",
+                                    'Best Model': r['model'],
+                                    'N Features': r['n_features']
+                                }
+                                for r in results[:10]  # Top 10
+                            ])
+                            
+                            st.dataframe(results_df, use_container_width=True)
+                            
+                            # Highlight best
+                            best = results[0]
+                            st.success(f"🏆 **Best Configuration:** {' + '.join(best['features'])} using {best['model']} (R² = {best['score']:.4f})")
+                
+                st.divider()
+                st.subheader("🎯 Train Final Models")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    train_total = st.checkbox("Train Total Hardness Model", value=True)
+                with col2:
+                    train_calcium = st.checkbox("Train Calcium Hardness Model", value=True)
+                
+                if st.button("⚡ Train Selected Models"):
+                    trained_models = []
+                    
+                    for target in available_targets:
+                        should_train = (train_total and 'total' in target.lower()) or \
+                                     (train_calcium and 'calcium' in target.lower())
+                        
+                        if should_train:
+                            # Use best combination if available
+                            if target in st.session_state.combination_results and st.session_state.combination_results[target]:
+                                best_config = st.session_state.combination_results[target][0]
+                                features = best_config['features']
+                                best_algorithm = best_config['model']
+                            else:
+                                features = available_predictors
+                                best_algorithm = algorithm_choice
+                            
+                            with st.spinner(f"Training {target} model..."):
+                                model, scaler, metrics = st.session_state.predictor.train_model(
+                                    df, target, features, best_algorithm
+                                )
+                                
+                                if model is not None:
+                                    trained_models.append({
+                                        'target': target,
+                                        'features': features,
+                                        'algorithm': best_algorithm,
+                                        'metrics': metrics
+                                    })
+                    
+                    # Save models
+                    save_models()
+                    
+                    # Display results
+                    if trained_models:
+                        st.success(f"✅ Successfully trained {len(trained_models)} model(s)")
+                        
+                        for result in trained_models:
+                            with st.expander(f"📈 {result['target']} - {result['algorithm']}"):
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("R² Score", f"{result['metrics']['r2']:.3f}")
+                                with col2:
+                                    st.metric("RMSE", f"{result['metrics']['rmse']:.1f}")
+                                with col3:
+                                    st.metric("MAE", f"{result['metrics']['mae']:.1f}")
+                                with col4:
+                                    st.metric("Samples", result['metrics']['n_samples'])
+                                
+                                st.write(f"**Features used:** {', '.join(result['features'])}")
+            else:
+                st.warning("Could not detect predictor or target columns. Please check your data format.")
+        else:
+            st.info("👆 Upload data first to train models")
+    
+    with tab3:
         st.header("Make Predictions")
         
-        if st.session_state.models:
-            st.subheader("Input Parameters")
+        if st.session_state.predictor.models:
+            st.subheader("Enter Water Quality Parameters")
             
             col1, col2 = st.columns(2)
             
             with col1:
-                conductivity_input = st.number_input(
-                    "Conductivity (µS/cm)",
-                    min_value=0.0,
-                    max_value=10000.0,
-                    value=float(df['Conductivity (µS/cm)'].mean()) if 'Conductivity (µS/cm)' in df.columns else 4500.0,
-                    step=50.0
-                )
+                ec_value = st.number_input("EC / Conductivity (µS/cm)", 
+                                          min_value=0.0, 
+                                          max_value=20000.0, 
+                                          value=4500.0,
+                                          step=50.0)
                 
-                ph_input = st.number_input(
-                    "pH",
-                    min_value=0.0,
-                    max_value=14.0,
-                    value=float(df['pH'].mean()) if 'pH' in df.columns else 7.5,
-                    step=0.1
-                )
+                ph_value = st.number_input("pH", 
+                                          min_value=0.0, 
+                                          max_value=14.0, 
+                                          value=7.5,
+                                          step=0.1)
             
             with col2:
                 if st.button("🔮 Predict All Parameters", type="primary"):
-                    st.subheader("Predictions")
+                    input_data = {
+                        'EC': ec_value,
+                        'pH': ph_value,
+                        'Conductivity (µS/cm)': ec_value,
+                        'conductivity': ec_value,
+                        'ph': ph_value
+                    }
                     
-                    input_df = pd.DataFrame({
-                        'Conductivity (µS/cm)': [conductivity_input],
-                        'pH': [ph_input]
-                    })
+                    predictions = {}
                     
-                    for target, model_data in st.session_state.models.items():
-                        # Create features
-                        X = create_features(input_df, model_data['predictors'])
-                        X_scaled = model_data['scaler'].transform(X)
+                    for target in st.session_state.predictor.models.keys():
+                        try:
+                            pred = st.session_state.predictor.predict(input_data, target)
+                            if pred is not None:
+                                predictions[target] = pred
+                        except Exception as e:
+                            st.error(f"Error predicting {target}: {e}")
+                    
+                    if predictions:
+                        st.success("✅ Predictions Complete!")
                         
-                        # Predict
-                        prediction = model_data['model'].predict(X_scaled)[0]
-                        
-                        # Display
-                        st.metric(
-                            label=target,
-                            value=f"{prediction:.1f} ppm",
-                            help=f"Using: {', '.join(model_data['predictors'])}"
-                        )
-                    
-                    st.success("✅ Predictions complete!")
+                        for target, value in predictions.items():
+                            features_used = st.session_state.predictor.feature_configs.get(target, [])
+                            model_used = st.session_state.predictor.model_names.get(target, 'Unknown')
+                            
+                            st.metric(
+                                label=f"**{target}**",
+                                value=f"{value:.1f} ppm",
+                                help=f"Model: {model_used} | Features: {', '.join(features_used)}"
+                            )
+                    else:
+                        st.error("No predictions could be made")
             
+            # Add actual measurement for retraining
             st.divider()
+            st.subheader("📝 Add Actual Measurement for Continuous Learning")
             
-            # Add feedback
-            st.subheader("📝 Add Actual Measurement (Continuous Learning)")
-            
-            with st.expander("Provide Feedback to Improve Models"):
-                feedback_target = st.selectbox("Parameter", list(st.session_state.models.keys()))
-                actual_value = st.number_input("Actual Measured Value (ppm)", min_value=0.0, value=1400.0)
+            with st.expander("Provide Feedback"):
+                feedback_target = st.selectbox("Which parameter?", 
+                                              list(st.session_state.predictor.models.keys()))
+                actual_value = st.number_input("Actual measured value (ppm)", 
+                                              min_value=0.0, 
+                                              value=1400.0)
                 
                 if st.button("✅ Add to Training Data"):
                     new_row = {
-                        'Date': datetime.now().strftime('%Y-%m-%d'),
-                        'Conductivity (µS/cm)': conductivity_input,
-                        'pH': ph_input,
-                        feedback_target: actual_value
+                        'EC': ec_value,
+                        'pH': ph_value,
+                        'Conductivity (µS/cm)': ec_value,
+                        feedback_target: actual_value,
+                        'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     }
                     
-                    st.session_state.data = pd.concat([
-                        st.session_state.data,
+                    st.session_state.training_data = pd.concat([
+                        st.session_state.training_data,
                         pd.DataFrame([new_row])
                     ], ignore_index=True)
                     
-                    st.success("✅ Data added! Retrain models to incorporate new data.")
+                    # Retrain
+                    features = st.session_state.predictor.feature_configs.get(feedback_target, ['EC', 'pH'])
+                    algorithm = st.session_state.predictor.model_names.get(feedback_target, 'Random Forest')
+                    
+                    with st.spinner("Retraining model..."):
+                        st.session_state.predictor.train_model(
+                            st.session_state.training_data,
+                            feedback_target,
+                            features,
+                            algorithm
+                        )
+                        save_models()
+                    
+                    st.success("✅ Model updated with new data!")
                     st.balloons()
         else:
-            st.info("👈 Train models first in the 'Best Models & Training' tab")
+            st.info("👈 Train models first in the 'Model Training' tab")
+    
+    with tab4:
+        st.header("Model Performance Analysis")
+        
+        if st.session_state.predictor.models:
+            for target, model in st.session_state.predictor.models.items():
+                st.subheader(f"📊 {target}")
+                
+                # Get data for this target
+                df = st.session_state.training_data
+                features = st.session_state.predictor.feature_configs[target]
+                
+                valid_cols = features + [target]
+                valid_data = df[valid_cols].dropna()
+                
+                if len(valid_data) > 0:
+                    # Make predictions
+                    X = st.session_state.predictor.create_engineered_features(valid_data, features)
+                    X_scaled = st.session_state.predictor.scalers[target].transform(X)
+                    
+                    y_true = valid_data[target].values
+                    y_pred = model.predict(X_scaled)
+                    
+                    # Metrics
+                    r2 = r2_score(y_true, y_pred)
+                    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+                    mae = mean_absolute_error(y_true, y_pred)
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Model", st.session_state.predictor.model_names[target])
+                    with col2:
+                        st.metric("R² Score", f"{r2:.3f}")
+                    with col3:
+                        st.metric("RMSE", f"{rmse:.1f} ppm")
+                    with col4:
+                        st.metric("MAE", f"{mae:.1f} ppm")
+                    
+                    # Visualization
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Predicted vs Actual
+                        fig = go.Figure()
+                        
+                        min_val = min(min(y_true), min(y_pred))
+                        max_val = max(max(y_true), max(y_pred))
+                        fig.add_trace(go.Scatter(x=[min_val, max_val], 
+                                               y=[min_val, max_val],
+                                               mode='lines', 
+                                               name='Perfect',
+                                               line=dict(dash='dash', color='red')))
+                        
+                        fig.add_trace(go.Scatter(x=y_true, 
+                                               y=y_pred,
+                                               mode='markers',
+                                               name='Predictions',
+                                               marker=dict(size=10)))
+                        
+                        fig.update_layout(
+                            title="Predicted vs Actual",
+                            xaxis_title="Actual (ppm)",
+                            yaxis_title="Predicted (ppm)",
+                            height=400
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        # Residuals
+                        residuals = y_true - y_pred
+                        
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=y_pred, 
+                                               y=residuals,
+                                               mode='markers',
+                                               marker=dict(size=10)))
+                        fig.add_hline(y=0, line_dash="dash", line_color="red")
+                        
+                        fig.update_layout(
+                            title="Residuals Plot",
+                            xaxis_title="Predicted (ppm)",
+                            yaxis_title="Residuals (ppm)",
+                            height=400
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Feature importance for Random Forest
+                    if hasattr(model, 'feature_importances_'):
+                        st.subheader("🎯 Feature Importance")
+                        
+                        feature_names = X.columns.tolist()
+                        importances = model.feature_importances_
+                        
+                        # Sort by importance
+                        indices = np.argsort(importances)[::-1][:10]  # Top 10
+                        
+                        fig = go.Figure(data=[
+                            go.Bar(x=[feature_names[i] for i in indices],
+                                  y=[importances[i] for i in indices])
+                        ])
+                        fig.update_layout(
+                            title="Top 10 Most Important Features",
+                            xaxis_title="Feature",
+                            yaxis_title="Importance",
+                            height=400
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.write(f"**Features used:** {', '.join(features)}")
+                    
+                st.divider()
+        else:
+            st.info("👈 Train models first to see performance metrics")
+    
+    with tab5:
+        st.header("Training Data")
+        
+        if not st.session_state.training_data.empty:
+            st.dataframe(st.session_state.training_data, use_container_width=True)
+            
+            # Download button
+            csv = st.session_state.training_data.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Data",
+                data=csv,
+                file_name=f"water_quality_data_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+            
+            # Summary statistics
+            st.subheader("📊 Summary Statistics")
+            st.dataframe(st.session_state.training_data.describe(), use_container_width=True)
+        else:
+            st.info("No data loaded yet")
 
-else:
-    st.info("👈 Please upload your water testing CSV file to begin")
-    
-    st.markdown("""
-    ### Expected CSV Format:
-    
-    Your CSV should contain columns like:
-    - `Conductivity (µS/cm)` or `EC` - Electrical Conductivity
-    - `pH` - pH value
-    - `Total Hardness (ppm)` - Target variable 1
-    - `Calculated Hardness (ppm)` - Target variable 2 (Calcium Hardness)
-    
-    The system will automatically:
-    1. ✅ Analyze correlations between all predictors and targets
-    2. ✅ Test multiple ML algorithms (Random Forest, Gradient Boosting, Ridge, etc.)
-    3. ✅ Test all predictor combinations (pH only, EC only, pH+EC)
-    4. ✅ Recommend the best configuration for each target
-    5. ✅ Train optimized models
-    6. ✅ Provide predictions with confidence metrics
-    """)
+if __name__ == "__main__":
+    main()
