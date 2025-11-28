@@ -5,3 +5,4 @@ numpy
 plotly
 joblib==1.4.2
 statsmodels
+matplotlib
