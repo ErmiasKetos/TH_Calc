@@ -8,7 +8,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.svm import SVR
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score, LeaveOneOut
@@ -19,7 +19,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================
-# CONFIGURATION - File paths for persistent storage
+# CONFIGURATION
 # ============================================================
 DATA_FILE = 'water_quality_data.csv'
 MODELS_FILE = 'trained_models.pkl'
@@ -44,34 +44,62 @@ INITIAL_DATA = {
     'Iron_ppm': [0.15, 0.25, 0.19, 0.22, 0.18, 0.28, 0.12, 0.20, 0.17, 0.24, 0.21, 0.16, 0.23, 0.19]
 }
 
+# Algorithm descriptions
+ALGORITHM_INFO = {
+    'Random Forest': {
+        'description': 'Ensemble of decision trees. Great for non-linear relationships.',
+        'pros': 'Handles complex patterns, resistant to overfitting, shows feature importance',
+        'cons': 'Can be slow with large data, less interpretable',
+        'best_for': 'Complex, non-linear relationships'
+    },
+    'Gradient Boosting': {
+        'description': 'Builds trees sequentially, each correcting previous errors.',
+        'pros': 'Often highest accuracy, handles mixed data types well',
+        'cons': 'Can overfit, slower to train, sensitive to parameters',
+        'best_for': 'When maximum accuracy is needed'
+    },
+    'Ridge': {
+        'description': 'Linear regression with regularization to prevent overfitting.',
+        'pros': 'Fast, interpretable, good with correlated features',
+        'cons': 'Assumes linear relationships',
+        'best_for': 'Linear relationships, quick baseline'
+    },
+    'SVR': {
+        'description': 'Support Vector Regression - finds optimal hyperplane.',
+        'pros': 'Works well with small datasets, handles non-linear data',
+        'cons': 'Slower, requires feature scaling, less interpretable',
+        'best_for': 'Small datasets with complex patterns'
+    },
+    'Linear': {
+        'description': 'Simple linear regression - finds best straight line fit.',
+        'pros': 'Very fast, highly interpretable, good baseline',
+        'cons': 'Cannot capture non-linear relationships',
+        'best_for': 'Simple linear relationships, interpretability'
+    }
+}
+
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
 
 def get_initial_dataframe():
-    """Create DataFrame from embedded initial data"""
     return pd.DataFrame(INITIAL_DATA)
 
 def load_data():
-    """Load data from file or use initial data"""
     if os.path.exists(DATA_FILE):
         try:
             df = pd.read_csv(DATA_FILE)
             return df
         except:
             pass
-    
-    # Use initial data and save it
     df = get_initial_dataframe()
     save_data(df)
     return df
 
 def save_data(df):
-    """Save data to CSV file"""
     df.to_csv(DATA_FILE, index=False)
 
 def load_models():
-    """Load trained models from file"""
     if os.path.exists(MODELS_FILE):
         try:
             with open(MODELS_FILE, 'rb') as f:
@@ -81,12 +109,10 @@ def load_models():
     return {}
 
 def save_models(models):
-    """Save trained models to file"""
     with open(MODELS_FILE, 'wb') as f:
         pickle.dump(models, f)
 
 def load_configs():
-    """Load best configurations from file"""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
@@ -96,27 +122,10 @@ def load_configs():
     return {}
 
 def save_configs(configs):
-    """Save best configurations to file"""
     with open(CONFIG_FILE, 'w') as f:
         json.dump(configs, f)
 
-def calculate_correlations(df, predictors, target):
-    """Calculate Pearson correlations"""
-    correlations = {}
-    p_values = {}
-    
-    for predictor in predictors:
-        if predictor in df.columns and target in df.columns:
-            valid_data = df[[predictor, target]].dropna()
-            if len(valid_data) >= 3:
-                corr, p_val = stats.pearsonr(valid_data[predictor], valid_data[target])
-                correlations[predictor] = corr
-                p_values[predictor] = p_val
-    
-    return correlations, p_values
-
 def create_features(df, predictor_cols):
-    """Create engineered features from predictors"""
     X = df[predictor_cols].copy()
     
     if len(predictor_cols) == 2:
@@ -130,8 +139,18 @@ def create_features(df, predictor_cols):
     
     return X
 
+def get_model_instance(algorithm):
+    """Get a fresh model instance"""
+    models_dict = {
+        'Random Forest': RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42, n_jobs=-1),
+        'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, learning_rate=0.05, random_state=42),
+        'Ridge': Ridge(alpha=1.0),
+        'SVR': SVR(kernel='rbf', C=100, gamma='scale'),
+        'Linear': LinearRegression()
+    }
+    return models_dict.get(algorithm)
+
 def evaluate_combination(df, predictors, target, algorithm):
-    """Evaluate a predictor/algorithm combination"""
     required_cols = predictors + [target]
     valid_data = df[required_cols].dropna()
     
@@ -144,15 +163,7 @@ def evaluate_combination(df, predictors, target, algorithm):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    models_dict = {
-        'Random Forest': RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42, n_jobs=-1),
-        'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, learning_rate=0.05, random_state=42),
-        'Ridge': Ridge(alpha=1.0),
-        'SVR': SVR(kernel='rbf', C=100, gamma='scale'),
-        'Linear': LinearRegression()
-    }
-    
-    model = models_dict.get(algorithm)
+    model = get_model_instance(algorithm)
     if model is None:
         return None
     
@@ -162,7 +173,7 @@ def evaluate_combination(df, predictors, target, algorithm):
             predictions, actuals = [], []
             
             for train_idx, test_idx in loo.split(X_scaled):
-                model_clone = models_dict.get(algorithm)
+                model_clone = get_model_instance(algorithm)
                 model_clone.fit(X_scaled[train_idx], y[train_idx])
                 predictions.append(model_clone.predict(X_scaled[test_idx])[0])
                 actuals.append(y[test_idx][0])
@@ -183,7 +194,6 @@ def evaluate_combination(df, predictors, target, algorithm):
         return None
 
 def train_model(df, predictors, target, algorithm):
-    """Train final model"""
     required_cols = predictors + [target]
     valid_data = df[required_cols].dropna()
     
@@ -196,15 +206,7 @@ def train_model(df, predictors, target, algorithm):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    models_dict = {
-        'Random Forest': RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42, n_jobs=-1),
-        'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, learning_rate=0.05, random_state=42),
-        'Ridge': Ridge(alpha=1.0),
-        'SVR': SVR(kernel='rbf', C=100, gamma='scale'),
-        'Linear': LinearRegression()
-    }
-    
-    model = models_dict.get(algorithm)
+    model = get_model_instance(algorithm)
     model.fit(X_scaled, y)
     
     y_pred = model.predict(X_scaled)
@@ -225,15 +227,19 @@ def train_model(df, predictors, target, algorithm):
         'y_pred': y_pred
     }
 
-def find_best_configuration(df, target):
-    """Find best predictor/algorithm combination for a target"""
+def find_best_configuration(df, target, user_algorithm=None):
+    """Find best configuration, optionally using user-selected algorithm"""
     predictor_options = {
         'Conductivity Only': ['Conductivity_uS_cm'],
         'pH Only': ['pH'],
         'Conductivity + pH': ['Conductivity_uS_cm', 'pH']
     }
     
-    algorithms = ['Random Forest', 'Gradient Boosting', 'Ridge', 'SVR', 'Linear']
+    # If user selected an algorithm, only test that one
+    if user_algorithm:
+        algorithms = [user_algorithm]
+    else:
+        algorithms = ['Random Forest', 'Gradient Boosting', 'Ridge', 'SVR', 'Linear']
     
     best_result = None
     best_config = None
@@ -254,21 +260,34 @@ def find_best_configuration(df, target):
     
     return best_config
 
-def run_full_analysis(df):
-    """Run complete analysis and training"""
+def run_full_analysis(df, user_algorithm_total=None, user_algorithm_calcium=None):
+    """Run analysis with optional user-selected algorithms"""
     targets = ['Total_Hardness_ppm', 'Calculated_Hardness_ppm']
     predictors = ['Conductivity_uS_cm', 'pH']
     
-    # Correlation analysis
+    # Correlations
     correlations = {}
     for target in targets:
-        corrs, pvals = calculate_correlations(df, predictors, target)
+        corrs = {}
+        pvals = {}
+        for predictor in predictors:
+            if predictor in df.columns and target in df.columns:
+                valid_data = df[[predictor, target]].dropna()
+                if len(valid_data) >= 3:
+                    r, p = stats.pearsonr(valid_data[predictor], valid_data[target])
+                    corrs[predictor] = r
+                    pvals[predictor] = p
         correlations[target] = {'correlations': corrs, 'p_values': pvals}
     
-    # Find best configurations
+    # Find best configs
     best_configs = {}
+    user_algorithms = {
+        'Total_Hardness_ppm': user_algorithm_total,
+        'Calculated_Hardness_ppm': user_algorithm_calcium
+    }
+    
     for target in targets:
-        config = find_best_configuration(df, target)
+        config = find_best_configuration(df, target, user_algorithms.get(target))
         if config:
             best_configs[target] = config
     
@@ -287,21 +306,21 @@ def run_full_analysis(df):
 
 st.set_page_config(page_title="Water Hardness Predictor", page_icon="💧", layout="wide")
 
-# Initialize on first run
+# Initialize session state
 if 'initialized' not in st.session_state:
     st.session_state.initialized = False
     st.session_state.data = None
     st.session_state.correlations = None
     st.session_state.best_configs = None
     st.session_state.models = None
+    st.session_state.user_algo_total = None
+    st.session_state.user_algo_calcium = None
 
-# Auto-initialize and train on startup
+# Auto-initialize on startup
 if not st.session_state.initialized:
-    with st.spinner("🚀 Initializing system, loading data, and training models..."):
-        # Load data
+    with st.spinner("🚀 Initializing system and training models..."):
         st.session_state.data = load_data()
         
-        # Try to load existing models
         saved_models = load_models()
         saved_configs = load_configs()
         
@@ -314,17 +333,22 @@ if not st.session_state.initialized:
             targets = ['Total_Hardness_ppm', 'Calculated_Hardness_ppm']
             correlations = {}
             for target in targets:
-                corrs, pvals = calculate_correlations(st.session_state.data, predictors, target)
+                corrs = {}
+                pvals = {}
+                for predictor in predictors:
+                    if predictor in st.session_state.data.columns and target in st.session_state.data.columns:
+                        valid_data = st.session_state.data[[predictor, target]].dropna()
+                        if len(valid_data) >= 3:
+                            r, p = stats.pearsonr(valid_data[predictor], valid_data[target])
+                            corrs[predictor] = r
+                            pvals[predictor] = p
                 correlations[target] = {'correlations': corrs, 'p_values': pvals}
             st.session_state.correlations = correlations
         else:
-            # Run full analysis and training
             correlations, best_configs, models = run_full_analysis(st.session_state.data)
             st.session_state.correlations = correlations
             st.session_state.best_configs = best_configs
             st.session_state.models = models
-            
-            # Save for next time
             save_models(models)
             save_configs(best_configs)
         
@@ -335,36 +359,79 @@ if not st.session_state.initialized:
 # ============================================================
 
 st.title("💧 Water Hardness Prediction System")
-st.markdown("**Auto-Training ML System for Total & Calcium Hardness Prediction**")
+st.markdown("**ML System with User-Selectable Algorithms**")
 
-# Status indicator
+# Status bar
 col1, col2, col3, col4 = st.columns(4)
 with col1:
-    st.success(f"✅ Data Loaded: {len(st.session_state.data)} records")
+    st.success(f"✅ Data: {len(st.session_state.data)} records")
 with col2:
     if st.session_state.models:
-        st.success(f"✅ Models Trained: {len(st.session_state.models)}")
-    else:
-        st.error("❌ No Models")
+        st.success(f"✅ Models: {len(st.session_state.models)}")
 with col3:
     if st.session_state.best_configs:
-        st.success("✅ Configs Ready")
+        st.success("✅ Ready")
 with col4:
-    st.info(f"📅 Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    st.info(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-# Sidebar - Add New Data
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header("🤖 Algorithm Selection")
+
+st.sidebar.markdown("**Choose algorithms for each target:**")
+
+# Algorithm selection for Total Hardness
+algo_total = st.sidebar.selectbox(
+    "Total Hardness Algorithm",
+    ['Auto (Best)', 'Random Forest', 'Gradient Boosting', 'Ridge', 'SVR', 'Linear'],
+    index=0,
+    key='algo_total_select'
+)
+
+# Algorithm selection for Calcium Hardness
+algo_calcium = st.sidebar.selectbox(
+    "Calcium Hardness Algorithm",
+    ['Auto (Best)', 'Random Forest', 'Gradient Boosting', 'Ridge', 'SVR', 'Linear'],
+    index=0,
+    key='algo_calcium_select'
+)
+
+# Retrain button with selected algorithms
+if st.sidebar.button("🔄 Retrain with Selected Algorithms", type="primary"):
+    user_algo_total = None if algo_total == 'Auto (Best)' else algo_total
+    user_algo_calcium = None if algo_calcium == 'Auto (Best)' else algo_calcium
+    
+    with st.spinner("Retraining with selected algorithms..."):
+        correlations, best_configs, models = run_full_analysis(
+            st.session_state.data,
+            user_algorithm_total=user_algo_total,
+            user_algorithm_calcium=user_algo_calcium
+        )
+        st.session_state.correlations = correlations
+        st.session_state.best_configs = best_configs
+        st.session_state.models = models
+        st.session_state.user_algo_total = user_algo_total
+        st.session_state.user_algo_calcium = user_algo_calcium
+        save_models(models)
+        save_configs(best_configs)
+    
+    st.sidebar.success("✅ Retrained!")
+    st.rerun()
+
+st.sidebar.divider()
+
+# Add new data section
 st.sidebar.header("➕ Add New Data")
 
 with st.sidebar.form("add_data_form"):
-    st.subheader("Enter New Measurement")
-    
     new_date = st.text_input("Date", value=datetime.now().strftime('%d-%m-%y'))
     new_conductivity = st.number_input("Conductivity (µS/cm)", min_value=0.0, value=4500.0, step=50.0)
     new_ph = st.number_input("pH", min_value=0.0, max_value=14.0, value=8.0, step=0.1)
     new_total_hardness = st.number_input("Total Hardness (ppm)", min_value=0.0, value=1400.0, step=10.0)
-    new_calcium_hardness = st.number_input("Calcium/Calculated Hardness (ppm)", min_value=0.0, value=1100.0, step=10.0)
+    new_calcium_hardness = st.number_input("Calcium Hardness (ppm)", min_value=0.0, value=1100.0, step=10.0)
     
-    # Optional fields
     with st.expander("Optional Fields"):
         new_chloride = st.number_input("Chloride (ppm)", min_value=0.0, value=600.0)
         new_alkalinity = st.number_input("Alkalinity (ppm)", min_value=0.0, value=85.0)
@@ -373,10 +440,9 @@ with st.sidebar.form("add_data_form"):
         new_sulfates = st.number_input("Sulfates (ppm)", min_value=0.0, value=1200.0)
         new_iron = st.number_input("Iron (ppm)", min_value=0.0, value=0.2, step=0.01)
     
-    submitted = st.form_submit_button("➕ Add Data & Retrain", type="primary")
+    submitted = st.form_submit_button("➕ Add & Retrain")
     
     if submitted:
-        # Add new row
         new_row = pd.DataFrame({
             'Date': [new_date],
             'Calculated_Hardness_ppm': [new_calcium_hardness],
@@ -392,50 +458,36 @@ with st.sidebar.form("add_data_form"):
         })
         
         st.session_state.data = pd.concat([st.session_state.data, new_row], ignore_index=True)
-        
-        # Save updated data
         save_data(st.session_state.data)
         
-        # Retrain models
-        with st.spinner("Retraining models with new data..."):
-            correlations, best_configs, models = run_full_analysis(st.session_state.data)
+        # Use current algorithm selections
+        user_algo_total = None if algo_total == 'Auto (Best)' else algo_total
+        user_algo_calcium = None if algo_calcium == 'Auto (Best)' else algo_calcium
+        
+        with st.spinner("Retraining..."):
+            correlations, best_configs, models = run_full_analysis(
+                st.session_state.data,
+                user_algorithm_total=user_algo_total,
+                user_algorithm_calcium=user_algo_calcium
+            )
             st.session_state.correlations = correlations
             st.session_state.best_configs = best_configs
             st.session_state.models = models
-            
             save_models(models)
             save_configs(best_configs)
         
-        st.sidebar.success("✅ Data added and models retrained!")
+        st.sidebar.success("✅ Added & retrained!")
         st.rerun()
 
-# Sidebar - Manual Retrain
-st.sidebar.divider()
-if st.sidebar.button("🔄 Force Retrain Models"):
-    with st.spinner("Retraining all models..."):
-        correlations, best_configs, models = run_full_analysis(st.session_state.data)
-        st.session_state.correlations = correlations
-        st.session_state.best_configs = best_configs
-        st.session_state.models = models
-        
-        save_models(models)
-        save_configs(best_configs)
-    
-    st.sidebar.success("✅ Models retrained!")
-    st.rerun()
+# ============================================================
+# MAIN TABS
+# ============================================================
 
-# Main Tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🔮 Predictions",
-    "📈 Correlation Analysis", 
-    "🤖 Model Performance",
-    "📊 Data View",
-    "⚙️ All Configurations"
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🔮 Predictions", "📈 Correlations", "🤖 Models", "📊 Data", "⚙️ Compare All", "📚 Help"
 ])
 
-# ============================================================
 # TAB 1: PREDICTIONS
-# ============================================================
 with tab1:
     st.header("🔮 Make Predictions")
     
@@ -446,26 +498,22 @@ with tab1:
         
         pred_conductivity = st.number_input(
             "Conductivity (µS/cm)",
-            min_value=1000.0,
-            max_value=10000.0,
+            min_value=1000.0, max_value=10000.0,
             value=float(st.session_state.data['Conductivity_uS_cm'].mean()),
-            step=50.0,
-            key="pred_cond"
+            step=50.0, key="pred_cond"
         )
         
         pred_ph = st.number_input(
             "pH",
-            min_value=5.0,
-            max_value=10.0,
+            min_value=5.0, max_value=10.0,
             value=float(st.session_state.data['pH'].mean()),
-            step=0.1,
-            key="pred_ph"
+            step=0.1, key="pred_ph"
         )
         
-        predict_btn = st.button("🔮 Predict Hardness", type="primary", use_container_width=True)
+        predict_btn = st.button("🔮 Predict", type="primary", use_container_width=True)
     
     with col2:
-        st.subheader("Prediction Results")
+        st.subheader("Results")
         
         if predict_btn and st.session_state.models:
             input_df = pd.DataFrame({
@@ -473,88 +521,78 @@ with tab1:
                 'pH': [pred_ph]
             })
             
-            results_col1, results_col2 = st.columns(2)
+            cols = st.columns(2)
             
             for i, (target, model_data) in enumerate(st.session_state.models.items()):
                 X = create_features(input_df, model_data['predictors'])
                 X_scaled = model_data['scaler'].transform(X)
                 prediction = model_data['model'].predict(X_scaled)[0]
                 
-                # Determine display name
                 display_name = "Total Hardness" if "Total" in target else "Calcium Hardness"
                 
-                with results_col1 if i == 0 else results_col2:
-                    st.metric(
-                        label=f"**{display_name}**",
-                        value=f"{prediction:.0f} ppm"
-                    )
+                with cols[i]:
+                    st.metric(label=f"**{display_name}**", value=f"{prediction:.0f} ppm")
                     
                     config = st.session_state.best_configs.get(target, {})
-                    st.caption(f"Model: {config.get('algorithm', 'N/A')}")
-                    st.caption(f"Features: {config.get('predictors_name', 'N/A')}")
-                    st.caption(f"R² Score: {config.get('r2', 0):.3f}")
+                    st.caption(f"🤖 Algorithm: **{config.get('algorithm', 'N/A')}**")
+                    st.caption(f"📊 R² Score: **{config.get('r2', 0):.3f}**")
+                    st.caption(f"📐 Features: {config.get('predictors_name', 'N/A')}")
             
             st.success("✅ Predictions complete!")
             
-            # Show input ranges
+            # Range check
             st.divider()
-            st.subheader("Training Data Ranges (for reference)")
+            cond_min = st.session_state.data['Conductivity_uS_cm'].min()
+            cond_max = st.session_state.data['Conductivity_uS_cm'].max()
+            ph_min = st.session_state.data['pH'].min()
+            ph_max = st.session_state.data['pH'].max()
             
-            range_col1, range_col2, range_col3 = st.columns(3)
-            with range_col1:
-                st.metric("Conductivity Range", 
-                         f"{st.session_state.data['Conductivity_uS_cm'].min():.0f} - {st.session_state.data['Conductivity_uS_cm'].max():.0f}")
-            with range_col2:
-                st.metric("pH Range",
-                         f"{st.session_state.data['pH'].min():.2f} - {st.session_state.data['pH'].max():.2f}")
-            with range_col3:
-                in_range = (st.session_state.data['Conductivity_uS_cm'].min() <= pred_conductivity <= st.session_state.data['Conductivity_uS_cm'].max() and
-                           st.session_state.data['pH'].min() <= pred_ph <= st.session_state.data['pH'].max())
-                if in_range:
-                    st.success("✅ Input within training range")
-                else:
-                    st.warning("⚠️ Input outside training range")
-        
-        elif not st.session_state.models:
-            st.error("No models trained. Please check the Model Performance tab.")
+            in_range = (cond_min <= pred_conductivity <= cond_max and ph_min <= pred_ph <= ph_max)
+            
+            if in_range:
+                st.info(f"✅ Input within training range")
+            else:
+                st.warning(f"⚠️ Input outside training range - predictions may be less accurate")
 
-# ============================================================
-# TAB 2: CORRELATION ANALYSIS
-# ============================================================
+# TAB 2: CORRELATIONS
 with tab2:
     st.header("📈 Correlation Analysis")
     
     if st.session_state.correlations:
-        # Correlation heatmap
+        # Heatmap
         st.subheader("Correlation Heatmap")
         
-        numeric_cols = ['Conductivity_uS_cm', 'pH', 'Total_Hardness_ppm', 'Calculated_Hardness_ppm', 
-                       'Alkalinity_ppm', 'Chloride_ppm', 'Sulfates_ppm']
+        numeric_cols = ['Conductivity_uS_cm', 'pH', 'Total_Hardness_ppm', 'Calculated_Hardness_ppm']
         available_cols = [c for c in numeric_cols if c in st.session_state.data.columns]
         
         corr_matrix = st.session_state.data[available_cols].corr()
         
-        fig = px.imshow(corr_matrix, text_auto='.3f', aspect='auto',
-                       color_continuous_scale='RdBu_r', zmin=-1, zmax=1)
+        fig = go.Figure(data=go.Heatmap(
+            z=corr_matrix.values,
+            x=corr_matrix.columns,
+            y=corr_matrix.columns,
+            colorscale='RdBu_r',
+            zmin=-1, zmax=1,
+            text=np.round(corr_matrix.values, 3),
+            texttemplate='%{text}',
+            textfont={"size": 12}
+        ))
         fig.update_layout(height=500)
         st.plotly_chart(fig, use_container_width=True)
         
-        # Detailed analysis for each target
         st.divider()
         
         for target in ['Total_Hardness_ppm', 'Calculated_Hardness_ppm']:
             display_name = "Total Hardness" if "Total" in target else "Calcium Hardness"
-            st.subheader(f"📊 {display_name} Correlations")
+            st.subheader(f"📊 {display_name}")
             
             if target in st.session_state.correlations:
                 corr_data = st.session_state.correlations[target]
                 correlations = corr_data['correlations']
-                p_values = corr_data['p_values']
                 
                 col1, col2 = st.columns([1, 2])
                 
                 with col1:
-                    # Bar chart
                     colors = ['green' if abs(v) > 0.5 else 'orange' if abs(v) > 0.3 else 'red' 
                              for v in correlations.values()]
                     
@@ -564,87 +602,103 @@ with tab2:
                               text=[f"{v:.3f}" for v in correlations.values()],
                               textposition='auto')
                     ])
-                    fig.update_layout(title=f"Correlations with {display_name}",
-                                    yaxis_range=[-1, 1], height=350)
+                    fig.update_layout(title="Correlation Coefficients", yaxis_range=[-1, 1], height=350)
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # Best predictor
                     best = max(correlations.items(), key=lambda x: abs(x[1]))
                     strength = "Strong" if abs(best[1]) > 0.5 else "Moderate" if abs(best[1]) > 0.3 else "Weak"
-                    st.info(f"**Best Predictor:** {best[0]} (r = {best[1]:.3f}, {strength})")
+                    st.info(f"**Best:** {best[0]} (r={best[1]:.3f}, {strength})")
                 
                 with col2:
-                    # Scatter plots
-                    scatter_col1, scatter_col2 = st.columns(2)
+                    fig = make_subplots(rows=1, cols=2, subplot_titles=('Conductivity', 'pH'))
                     
-                    with scatter_col1:
-                        fig = px.scatter(st.session_state.data, x='Conductivity_uS_cm', y=target,
-                                       trendline="ols", title="Conductivity vs Hardness")
-                        fig.update_layout(height=300)
-                        st.plotly_chart(fig, use_container_width=True)
+                    fig.add_trace(go.Scatter(
+                        x=st.session_state.data['Conductivity_uS_cm'],
+                        y=st.session_state.data[target],
+                        mode='markers', name='Conductivity',
+                        marker=dict(color='blue', size=10)
+                    ), row=1, col=1)
                     
-                    with scatter_col2:
-                        fig = px.scatter(st.session_state.data, x='pH', y=target,
-                                       trendline="ols", title="pH vs Hardness")
-                        fig.update_layout(height=300)
-                        st.plotly_chart(fig, use_container_width=True)
+                    fig.add_trace(go.Scatter(
+                        x=st.session_state.data['pH'],
+                        y=st.session_state.data[target],
+                        mode='markers', name='pH',
+                        marker=dict(color='green', size=10)
+                    ), row=1, col=2)
+                    
+                    fig.update_layout(height=350, showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
             
             st.divider()
 
-# ============================================================
-# TAB 3: MODEL PERFORMANCE
-# ============================================================
+# TAB 3: MODELS
 with tab3:
     st.header("🤖 Model Performance")
+    
+    # Metrics explanation
+    with st.expander("📚 What do these metrics mean?"):
+        st.markdown("""
+        | Metric | Name | Meaning | Good Value |
+        |--------|------|---------|------------|
+        | **R²** | Coefficient of Determination | How well the model explains variance (0-1) | > 0.7 good, > 0.9 excellent |
+        | **RMSE** | Root Mean Square Error | Average error in ppm (penalizes large errors) | Lower is better |
+        | **MAE** | Mean Absolute Error | Average absolute error in ppm | Lower is better |
+        
+        **Example:** R²=0.85 means the model explains 85% of the variation in hardness values.
+        """)
     
     if st.session_state.models and st.session_state.best_configs:
         for target, model_data in st.session_state.models.items():
             display_name = "Total Hardness" if "Total" in target else "Calcium Hardness"
             config = st.session_state.best_configs.get(target, {})
             
-            st.subheader(f"📊 {display_name} Model")
+            st.subheader(f"📊 {display_name}")
+            
+            # Algorithm info
+            algo = config.get('algorithm', 'N/A')
+            if algo in ALGORITHM_INFO:
+                with st.expander(f"ℹ️ About {algo}"):
+                    info = ALGORITHM_INFO[algo]
+                    st.markdown(f"**Description:** {info['description']}")
+                    st.markdown(f"**✅ Pros:** {info['pros']}")
+                    st.markdown(f"**❌ Cons:** {info['cons']}")
+                    st.markdown(f"**🎯 Best for:** {info['best_for']}")
             
             # Metrics
-            metrics_col1, metrics_col2, metrics_col3, metrics_col4, metrics_col5 = st.columns(5)
-            
-            with metrics_col1:
-                st.metric("Algorithm", config.get('algorithm', 'N/A'))
-            with metrics_col2:
-                st.metric("R² Score", f"{model_data['metrics']['r2']:.4f}")
-            with metrics_col3:
-                st.metric("RMSE", f"{model_data['metrics']['rmse']:.2f} ppm")
-            with metrics_col4:
-                st.metric("MAE", f"{model_data['metrics']['mae']:.2f} ppm")
-            with metrics_col5:
+            cols = st.columns(5)
+            with cols[0]:
+                st.metric("Algorithm", algo)
+            with cols[1]:
+                r2_val = model_data['metrics']['r2']
+                st.metric("R² Score", f"{r2_val:.4f}", 
+                         delta="Good" if r2_val > 0.7 else "Fair" if r2_val > 0.5 else "Poor")
+            with cols[2]:
+                st.metric("RMSE", f"{model_data['metrics']['rmse']:.1f} ppm")
+            with cols[3]:
+                st.metric("MAE", f"{model_data['metrics']['mae']:.1f} ppm")
+            with cols[4]:
                 st.metric("Samples", model_data['metrics']['n_samples'])
             
-            st.info(f"**Features Used:** {config.get('predictors_name', 'N/A')} ({', '.join(config.get('predictors', []))})")
+            st.info(f"**Features:** {config.get('predictors_name', 'N/A')}")
             
-            # Visualization
-            viz_col1, viz_col2 = st.columns(2)
+            # Plots
+            col1, col2 = st.columns(2)
             
-            with viz_col1:
-                # Predicted vs Actual
+            with col1:
                 fig = go.Figure()
-                
                 min_val = min(model_data['y_true'].min(), model_data['y_pred'].min())
                 max_val = max(model_data['y_true'].max(), model_data['y_pred'].max())
                 
                 fig.add_trace(go.Scatter(x=[min_val, max_val], y=[min_val, max_val],
-                                        mode='lines', name='Perfect',
-                                        line=dict(dash='dash', color='red')))
-                
+                                        mode='lines', name='Perfect', line=dict(dash='dash', color='red')))
                 fig.add_trace(go.Scatter(x=model_data['y_true'], y=model_data['y_pred'],
-                                        mode='markers', name='Predictions',
-                                        marker=dict(size=12, color='blue')))
+                                        mode='markers', name='Predictions', marker=dict(size=12, color='blue')))
                 
-                fig.update_layout(title="Predicted vs Actual",
-                                xaxis_title="Actual (ppm)", yaxis_title="Predicted (ppm)",
-                                height=400)
+                fig.update_layout(title="Predicted vs Actual", xaxis_title="Actual (ppm)", 
+                                yaxis_title="Predicted (ppm)", height=400)
                 st.plotly_chart(fig, use_container_width=True)
             
-            with viz_col2:
-                # Residuals
+            with col2:
                 residuals = model_data['y_true'] - model_data['y_pred']
                 
                 fig = go.Figure()
@@ -652,74 +706,70 @@ with tab3:
                                         mode='markers', marker=dict(size=12, color='blue')))
                 fig.add_hline(y=0, line_dash="dash", line_color="red")
                 
-                fig.update_layout(title="Residuals Plot",
-                                xaxis_title="Predicted (ppm)", yaxis_title="Residuals (ppm)",
-                                height=400)
+                fig.update_layout(title="Residuals (Errors)", xaxis_title="Predicted (ppm)",
+                                yaxis_title="Error (ppm)", height=400)
                 st.plotly_chart(fig, use_container_width=True)
             
-            # Feature importance for tree-based models
+            # Feature importance
             if hasattr(model_data['model'], 'feature_importances_'):
-                st.subheader("Feature Importance")
-                
+                st.subheader("🎯 Feature Importance")
                 importances = model_data['model'].feature_importances_
                 feature_names = model_data['feature_names']
                 indices = np.argsort(importances)[::-1]
                 
-                fig = go.Figure(data=[
-                    go.Bar(x=[feature_names[i] for i in indices],
-                          y=[importances[i] for i in indices])
-                ])
-                fig.update_layout(title="Feature Importance", height=350)
+                fig = go.Figure(data=[go.Bar(x=[feature_names[i] for i in indices],
+                                            y=[importances[i] for i in indices],
+                                            marker_color='steelblue')])
+                fig.update_layout(title="Which features matter most?", height=300)
                 st.plotly_chart(fig, use_container_width=True)
             
             st.divider()
-    else:
-        st.error("No models available. Please retrain.")
 
-# ============================================================
-# TAB 4: DATA VIEW
-# ============================================================
+# TAB 4: DATA
 with tab4:
-    st.header("📊 Training Data")
+    st.header("📊 Data")
     
-    # Summary stats
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Records", len(st.session_state.data))
-    with col2:
-        st.metric("Avg Total Hardness", f"{st.session_state.data['Total_Hardness_ppm'].mean():.0f} ppm")
-    with col3:
-        st.metric("Avg Calcium Hardness", f"{st.session_state.data['Calculated_Hardness_ppm'].mean():.0f} ppm")
-    with col4:
-        st.metric("Avg Conductivity", f"{st.session_state.data['Conductivity_uS_cm'].mean():.0f} µS/cm")
+    cols = st.columns(4)
+    with cols[0]:
+        st.metric("Records", len(st.session_state.data))
+    with cols[1]:
+        st.metric("Avg Total Hardness", f"{st.session_state.data['Total_Hardness_ppm'].mean():.0f}")
+    with cols[2]:
+        st.metric("Avg Calcium Hardness", f"{st.session_state.data['Calculated_Hardness_ppm'].mean():.0f}")
+    with cols[3]:
+        st.metric("Avg Conductivity", f"{st.session_state.data['Conductivity_uS_cm'].mean():.0f}")
     
-    # Data table
-    st.subheader("All Data")
     st.dataframe(st.session_state.data, use_container_width=True, height=400)
     
-    # Download button
     csv = st.session_state.data.to_csv(index=False)
-    st.download_button(
-        label="📥 Download Data as CSV",
-        data=csv,
-        file_name=f"water_quality_data_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
+    st.download_button("📥 Download CSV", csv, f"water_data_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
     
-    # Statistical summary
-    st.subheader("Statistical Summary")
-    st.dataframe(st.session_state.data.describe(), use_container_width=True)
-    
-    # Delete last row option
     st.divider()
     st.subheader("⚠️ Data Management")
     
-    if st.button("🗑️ Delete Last Row"):
-        if len(st.session_state.data) > 1:
-            st.session_state.data = st.session_state.data.iloc[:-1]
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🗑️ Delete Last Row"):
+            if len(st.session_state.data) > 1:
+                st.session_state.data = st.session_state.data.iloc[:-1]
+                save_data(st.session_state.data)
+                
+                correlations, best_configs, models = run_full_analysis(st.session_state.data)
+                st.session_state.correlations = correlations
+                st.session_state.best_configs = best_configs
+                st.session_state.models = models
+                save_models(models)
+                save_configs(best_configs)
+                
+                st.success("Deleted & retrained!")
+                st.rerun()
+    
+    with col2:
+        if st.button("🔄 Reset to Original"):
+            st.session_state.data = get_initial_dataframe()
             save_data(st.session_state.data)
             
-            # Retrain
             correlations, best_configs, models = run_full_analysis(st.session_state.data)
             st.session_state.correlations = correlations
             st.session_state.best_configs = best_configs
@@ -727,32 +777,16 @@ with tab4:
             save_models(models)
             save_configs(best_configs)
             
-            st.success("Last row deleted and models retrained!")
+            st.success("Reset to original 14 records!")
             st.rerun()
-        else:
-            st.error("Cannot delete - only one row remaining")
-    
-    if st.button("🔄 Reset to Original Data"):
-        st.session_state.data = get_initial_dataframe()
-        save_data(st.session_state.data)
-        
-        correlations, best_configs, models = run_full_analysis(st.session_state.data)
-        st.session_state.correlations = correlations
-        st.session_state.best_configs = best_configs
-        st.session_state.models = models
-        save_models(models)
-        save_configs(best_configs)
-        
-        st.success("Data reset to original 14 records!")
-        st.rerun()
 
-# ============================================================
-# TAB 5: ALL CONFIGURATIONS
-# ============================================================
+# TAB 5: COMPARE ALL
 with tab5:
-    st.header("⚙️ All Model Configurations Tested")
+    st.header("⚙️ Compare All Configurations")
     
-    if st.button("🔍 Run Full Configuration Comparison"):
+    st.markdown("Compare all combinations of **predictors** and **algorithms** to find the best configuration.")
+    
+    if st.button("🔍 Run Full Comparison", type="primary"):
         predictor_options = {
             'Conductivity Only': ['Conductivity_uS_cm'],
             'pH Only': ['pH'],
@@ -765,7 +799,6 @@ with tab5:
             st.subheader(f"📊 {display_name}")
             
             results = []
-            
             progress = st.progress(0)
             total = len(predictor_options) * len(algorithms)
             current = 0
@@ -798,14 +831,72 @@ with tab5:
                 best = results_df.iloc[0]
                 st.success(f"🏆 **Best:** {best['Predictors']} + {best['Algorithm']} | R² = {best['R² Score']:.4f}")
                 
-                # Visualization
-                fig = px.bar(results_df, x='Algorithm', y='R² Score', color='Predictors',
-                           barmode='group', title=f"All Configurations for {display_name}")
+                # Visual comparison
+                fig = go.Figure()
+                for pred_name in predictor_options.keys():
+                    subset = results_df[results_df['Predictors'] == pred_name]
+                    fig.add_trace(go.Bar(x=subset['Algorithm'], y=subset['R² Score'], name=pred_name))
+                
+                fig.update_layout(title=f"R² Score Comparison - {display_name}", 
+                                barmode='group', height=400,
+                                yaxis_title="R² Score")
                 st.plotly_chart(fig, use_container_width=True)
             
             st.divider()
 
+# TAB 6: HELP
+with tab6:
+    st.header("📚 Help & Documentation")
+    
+    st.subheader("📊 Understanding the Metrics")
+    
+    st.markdown("""
+    ### R² Score (Coefficient of Determination)
+    - **Range:** 0 to 1 (can be negative for very poor models)
+    - **Meaning:** Proportion of variance in the target explained by the model
+    - **Interpretation:**
+        - **> 0.9:** Excellent - model explains most variation
+        - **0.7 - 0.9:** Good - model is useful for predictions
+        - **0.5 - 0.7:** Moderate - model has some predictive power
+        - **< 0.5:** Poor - model needs improvement
+    
+    ### RMSE (Root Mean Square Error)
+    - **Units:** Same as target (ppm for hardness)
+    - **Meaning:** Average prediction error, with larger errors penalized more
+    - **Interpretation:** If RMSE = 50, expect predictions to be off by ~50 ppm on average
+    - **Lower is better**
+    
+    ### MAE (Mean Absolute Error)
+    - **Units:** Same as target (ppm for hardness)
+    - **Meaning:** Average absolute difference between predicted and actual
+    - **Interpretation:** More intuitive than RMSE - direct average error
+    - **Lower is better**
+    """)
+    
+    st.divider()
+    
+    st.subheader("🤖 Algorithm Guide")
+    
+    for algo, info in ALGORITHM_INFO.items():
+        with st.expander(f"**{algo}**"):
+            st.markdown(f"**Description:** {info['description']}")
+            st.markdown(f"**✅ Pros:** {info['pros']}")
+            st.markdown(f"**❌ Cons:** {info['cons']}")
+            st.markdown(f"**🎯 Best for:** {info['best_for']}")
+    
+    st.divider()
+    
+    st.subheader("🔄 How to Use This App")
+    
+    st.markdown("""
+    1. **Make Predictions:** Enter Conductivity and pH values to predict hardness
+    2. **View Correlations:** See how predictors relate to hardness values
+    3. **Check Model Performance:** Review accuracy metrics and visualizations
+    4. **Compare Algorithms:** Run full comparison to find the best configuration
+    5. **Select Algorithm:** Use the sidebar to choose a specific algorithm
+    6. **Add Data:** Add new measurements to improve model accuracy over time
+    """)
+
 # Footer
 st.divider()
-st.markdown("---")
-st.caption("💧 Water Hardness Prediction System | Data persists between sessions | Models auto-train on startup")
+st.caption("💧 Water Hardness Prediction | User-Selectable Algorithms | Auto-Training | Persistent Data")
